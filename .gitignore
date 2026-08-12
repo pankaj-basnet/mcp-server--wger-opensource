@@ -172,3 +172,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# wger-mcp specifics
+.env.probe
+
+# Editors
+.idea/
+.vscode/
