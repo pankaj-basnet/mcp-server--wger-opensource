@@ -30,6 +30,12 @@ SLOT_CONFIG_PATHS: dict[str, str] = {
 }
 
 
+# wger returns weight units as numeric ids. A plan is read by people and by
+# language models, and "weight_unit: 1" invites both to guess — so it is
+# rendered as its code.
+WEIGHT_UNIT_NAMES: dict[int, str] = {1: "kg", 2: "lb"}
+
+
 def _unknown_kind(kind: str) -> dict[str, Any]:
     return bad_request(
         f"unknown kind '{kind}'; expected one of {sorted(SLOT_CONFIG_PATHS)}"
@@ -142,7 +148,9 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
                     "sets": cfg.get("sets"),
                     "repetitions": cfg.get("repetitions"),
                     "weight": cfg.get("weight"),
-                    "weight_unit": cfg.get("weight_unit"),
+                    "weight_unit": WEIGHT_UNIT_NAMES.get(
+                        cfg.get("weight_unit"), cfg.get("weight_unit")
+                    ),
                     "rir": cfg.get("rir"),
                     "rest": cfg.get("rest"),
                     "text_repr": cfg.get("text_repr"),

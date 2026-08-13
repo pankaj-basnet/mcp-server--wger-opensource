@@ -117,6 +117,8 @@ async def test_returns_slot_entry_ids_for_today() -> None:
     assert entry["repetitions"] == 5
     # A name, not a bare id: reading the plan should not require a second lookup.
     assert entry["exercise_name"] == "Bench Press"
+    # Never a bare id: a caller reading "1" will guess, and guess wrong.
+    assert entry["weight_unit"] == "kg"
 
 
 async def test_date_outside_the_routine_is_not_an_error() -> None:
