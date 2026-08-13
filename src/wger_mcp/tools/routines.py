@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -34,6 +34,14 @@ SLOT_CONFIG_PATHS: dict[str, str] = {
 # language models, and "weight_unit: 1" invites both to guess — so it is
 # rendered as its code.
 WEIGHT_UNIT_NAMES: dict[int, str] = {1: "kg", 2: "lb"}
+# wger's Day.type choices (DayType, wger/manager/models/day.py). There is no
+# "standard" — posting one is rejected with
+# {"type": ["\"standard\" is not a valid choice."]}.
+DAY_TYPES = ("custom", "enom", "amrap", "hiit", "tabata", "edt", "rft", "afap")
+
+# wger requires an end date on every routine. Twelve weeks is a conventional
+# training block, and a caller who cares can always pass `end` explicitly.
+DEFAULT_ROUTINE_WEEKS = 12
 
 
 def _unknown_kind(kind: str) -> dict[str, Any]:
@@ -280,15 +288,22 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         end: date | None = None,
         fit_in_week: bool = False,
     ) -> dict[str, Any]:
-        """Create a training routine. Start defaults to today."""
+        """Create a training routine.
+
+        Start defaults to today. wger requires an end date, so one is derived
+        from the start when not given (12 weeks).
+        """
+        start_date = start or date.today()
+        end_date = end or start_date + timedelta(weeks=DEFAULT_ROUTINE_WEEKS)
+        if end_date <= start_date:
+            return bad_request("end must be after start")
         payload: dict[str, Any] = {
             "name": name,
             "description": description,
-            "start": (start or date.today()).isoformat(),
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
             "fit_in_week": fit_in_week,
         }
-        if end is not None:
-            payload["end"] = end.isoformat()
         try:
             return await client.post("routine/", json=payload)
         except WgerError as exc:
@@ -329,9 +344,17 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         order: Annotated[int, Field(ge=1, le=100)],
         description: str = "",
         is_rest: bool = False,
-        day_type: str = "standard",
+        day_type: str = "custom",
     ) -> dict[str, Any]:
-        """Add a training day to a routine."""
+        """Add a training day to a routine.
+
+        day_type is one of: custom, enom, amrap, hiit, tabata, edt, rft, afap.
+        Leave it alone for ordinary strength training.
+        """
+        if day_type not in DAY_TYPES:
+            return bad_request(
+                f"unknown day type '{day_type}'; expected one of {', '.join(DAY_TYPES)}"
+            )
         payload: dict[str, Any] = {
             "routine": routine_id,
             "order": order,

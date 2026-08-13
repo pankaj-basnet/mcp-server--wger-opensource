@@ -1,5 +1,8 @@
 # wger MCP server
 
+> [!IMPORTANT]
+> This is still a WIP, not all things might work correctly yet
+
 An [MCP](https://modelcontextprotocol.io) server that exposes the [wger](https://wger.de) (>= 2.6) fitness/nutrition REST API as tools (routines, workout logging, exercise & ingredient catalog, nutrition plans + meals + recipes, diary, body-weight tracking, gym equipment, body measurements, volume/PR analytics, daily calorie calculator, …) so that AI assistants can read and write your wger data.
 
 It talks to a wger instance over its public REST API — it is a separate service and requires no changes to wger itself.
