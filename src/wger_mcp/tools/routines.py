@@ -111,10 +111,12 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
     ) -> dict[str, Any]:
         """What the routine prescribes on a given date. Defaults to today.
 
-        Returns the day's label, its iteration, and one entry per planned
-        exercise: its name, slot_entry_id, and the planned sets, repetitions,
-        weight and RiR. Feed routine_id, slot_entry_id and iteration straight
-        into log_set so the logged set attaches to the plan.
+        Returns the day's label, its iteration, and one entry per planned SET
+        — an exercise prescribed for three sets appears three times, which is
+        wger's gym-mode view: each entry is one set to perform and then log.
+        Each carries the exercise name, its slot_entry_id, and the planned
+        repetitions, weight and RiR. Feed routine_id, slot_entry_id and
+        iteration straight into log_set so the logged set attaches to the plan.
 
         This is the one call that answers "what am I doing today" and "what is
         in this program". Reading the plan by walking days, slots, entries and
