@@ -1163,6 +1163,19 @@ wheels = [
 ]
 
 [[package]]
+name = "wger-api-client"
+version = "2.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/25/bd/2d16cd5207054bf6cec571ec1a5f1b6156ad0a0c6e1ac5a5af0ab2aa6995/wger_api_client-2.6.0.tar.gz", hash = "sha256:ad358c557bdf421364700d5d0f20e1b42b064bb3709585b77bb2b76e8e0333b3", size = 168901, upload-time = "2026-08-12T08:52:56.562Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b5/98/cee5ad909888cfd174450d3a7946527bb8b0ce1160ceebd315e8a5c88ae7/wger_api_client-2.6.0-py3-none-any.whl", hash = "sha256:d2dad9b96a947d4cceda9af89b7b57277315b737035b427b96a195977009cc9b", size = 618819, upload-time = "2026-08-12T08:52:55.096Z" },
+]
+
+[[package]]
 name = "wger-mcp"
 version = "0.1.0"
 source = { editable = "." }
@@ -1173,6 +1186,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "wger-api-client" },
 ]
 
 [package.dev-dependencies]
@@ -1191,6 +1205,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.4" },
     { name = "starlette", specifier = ">=0.37" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "wger-api-client", specifier = "~=2.6" },
 ]
 
 [package.metadata.requires-dev]

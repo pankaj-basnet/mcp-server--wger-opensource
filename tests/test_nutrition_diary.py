@@ -1,20 +1,30 @@
-"""Nutrition-diary timestamps: issue #5 — custom datetimes on log entries."""
+"""Nutrition-diary timestamps: issue #5 — custom datetimes on log entries.
+
+The wire format (URLs, serialisation, status codes) is the generated client's
+contract, tested in the wger-api-client repo. Here we only verify that the
+tools call the client with the right arguments.
+"""
 
 from __future__ import annotations
 
-import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID
 
 import pytest
-import respx
 from mcp.server.fastmcp import FastMCP
+from wger_api_client import models as api_models
+from wger_api_client.types import UNSET
 
+from wger_mcp.api_client import build_api_client
 from wger_mcp.config import Settings
 from wger_mcp.tools import nutrition
-from wger_mcp.wger_client import WgerClient
 
-API = "https://wger.test/api/v2"
+PLAN_ID = "018f6f30-0000-7000-8000-000000000001"
+MEAL_ID = "018f6f30-0000-7000-8000-000000000002"
+LOG_ID = "018f6f30-0000-7000-8000-000000000003"
+
+LOG_ITEM = api_models.LogItem(plan=UUID(PLAN_ID), ingredient=1, amount="100")
 
 
 class _StubProvider:
@@ -25,23 +35,32 @@ class _StubProvider:
         pass
 
 
-def _settings() -> Settings:
-    return Settings(  # type: ignore[call-arg]
+def _register() -> FastMCP:
+    mcp = FastMCP("test")
+    settings = Settings(  # type: ignore[call-arg]
         wger_base_url="https://wger.test",
         mcp_auth="none",
         wger_dev_token="dev",
     )
+    api = build_api_client(settings, _StubProvider())
+    nutrition.register(mcp, api, settings)
+    return mcp
 
 
-def _register() -> tuple[FastMCP, WgerClient]:
-    mcp = FastMCP("test")
-    client = WgerClient(API, _StubProvider())
-    nutrition.register(mcp, client, _settings())
-    return mcp, client
+class _Capture:
+    """Stands in for a generated endpoint function; records its kwargs."""
 
+    def __init__(self, result: Any) -> None:
+        self.result = result
+        self.calls: list[dict[str, Any]] = []
 
-def _sent(route: Any) -> dict[str, Any]:
-    return json.loads(route.calls.last.request.content)
+    async def __call__(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.result
+
+    @property
+    def body(self) -> Any:
+        return self.calls[-1]["body"]
 
 
 # ---------- _diary_timestamp ----------
@@ -76,110 +95,117 @@ def test_datetime_checked_before_date() -> None:
 
 
 @pytest.mark.asyncio
-async def test_log_ingredient_forwards_iso_datetime() -> None:
-    """Regression for issue #5: an ISO 8601 date-time reaches wger intact.
+async def test_log_ingredient_forwards_iso_datetime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression for issue #5: an ISO 8601 date-time reaches the client intact.
 
     Previously every entry was pinned to a hard-coded 12:00Z regardless of
     what the caller passed.
     """
-    mcp, client = _register()
-    async with client:
-        with respx.mock(base_url=API) as router:
-            route = router.post("/nutritiondiary/").respond(json={"id": 1})
-            await mcp.call_tool(
-                "log_ingredient",
-                {
-                    "plan_id": "plan-uuid",
-                    "ingredient_id": "1677954",
-                    "amount_g": 100,
-                    "when": "2026-07-21T07:00:00+02:00",
-                },
-            )
-    assert _sent(route)["datetime"] == "2026-07-21T07:00:00+02:00"
+    mcp = _register()
+    create = _Capture(LOG_ITEM)
+    monkeypatch.setattr(nutrition.nutritiondiary_create, "asyncio", create)
+    await mcp.call_tool(
+        "log_ingredient",
+        {
+            "plan_id": PLAN_ID,
+            "ingredient_id": "1677954",
+            "amount_g": 100,
+            "when": "2026-07-21T07:00:00+02:00",
+        },
+    )
+    tz = timezone(timedelta(hours=2))
+    assert create.body.datetime_ == datetime(2026, 7, 21, 7, 0, tzinfo=tz)
 
 
 @pytest.mark.asyncio
-async def test_log_ingredient_omits_datetime_when_unset() -> None:
-    """No 'when' must send no 'datetime', so wger stamps it itself."""
-    mcp, client = _register()
-    async with client:
-        with respx.mock(base_url=API) as router:
-            route = router.post("/nutritiondiary/").respond(json={"id": 1})
-            await mcp.call_tool(
-                "log_ingredient",
-                {"plan_id": "plan-uuid", "ingredient_id": "1", "amount_g": 50},
-            )
-    body = _sent(route)
-    assert "datetime" not in body
-    assert body == {"plan": "plan-uuid", "ingredient": "1", "amount": 50.0}
+async def test_log_ingredient_omits_datetime_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No 'when' must send no datetime, so wger stamps the entry itself."""
+    mcp = _register()
+    create = _Capture(LOG_ITEM)
+    monkeypatch.setattr(nutrition.nutritiondiary_create, "asyncio", create)
+    await mcp.call_tool(
+        "log_ingredient",
+        {"plan_id": PLAN_ID, "ingredient_id": "1", "amount_g": 50},
+    )
+    body = create.body
+    assert body.datetime_ is UNSET
+    assert body.plan == UUID(PLAN_ID)
+    assert body.ingredient == 1
+    assert body.amount == "50"
+    assert body.meal is UNSET
 
 
 @pytest.mark.asyncio
-async def test_log_ingredient_accepts_bare_date() -> None:
-    mcp, client = _register()
-    async with client:
-        with respx.mock(base_url=API) as router:
-            route = router.post("/nutritiondiary/").respond(json={"id": 1})
-            await mcp.call_tool(
-                "log_ingredient",
-                {
-                    "plan_id": "p",
-                    "ingredient_id": "1",
-                    "amount_g": 10,
-                    "when": "2026-07-21",
-                },
-            )
-    assert _sent(route)["datetime"] == "2026-07-21T12:00:00"
+async def test_log_ingredient_accepts_bare_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    mcp = _register()
+    create = _Capture(LOG_ITEM)
+    monkeypatch.setattr(nutrition.nutritiondiary_create, "asyncio", create)
+    await mcp.call_tool(
+        "log_ingredient",
+        {"plan_id": PLAN_ID, "ingredient_id": "1", "amount_g": 10, "when": "2026-07-21"},
+    )
+    assert create.body.datetime_ == datetime(2026, 7, 21, 12, 0)
 
 
 @pytest.mark.asyncio
-async def test_log_ingredient_optional_meal() -> None:
-    mcp, client = _register()
-    async with client:
-        with respx.mock(base_url=API) as router:
-            route = router.post("/nutritiondiary/").respond(json={"id": 1})
-            await mcp.call_tool(
-                "log_ingredient",
-                {"plan_id": "p", "ingredient_id": "1", "amount_g": 10, "meal_id": "m1"},
-            )
-    assert _sent(route)["meal"] == "m1"
+async def test_log_ingredient_optional_meal(monkeypatch: pytest.MonkeyPatch) -> None:
+    mcp = _register()
+    create = _Capture(LOG_ITEM)
+    monkeypatch.setattr(nutrition.nutritiondiary_create, "asyncio", create)
+    await mcp.call_tool(
+        "log_ingredient",
+        {"plan_id": PLAN_ID, "ingredient_id": "1", "amount_g": 10, "meal_id": MEAL_ID},
+    )
+    assert create.body.meal == UUID(MEAL_ID)
+
+
+@pytest.mark.asyncio
+async def test_log_ingredient_rejects_malformed_plan_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An id the API cannot address is refused locally, without a request."""
+    mcp = _register()
+    create = _Capture(LOG_ITEM)
+    monkeypatch.setattr(nutrition.nutritiondiary_create, "asyncio", create)
+    result = await mcp.call_tool(
+        "log_ingredient",
+        {"plan_id": "not-a-uuid", "ingredient_id": "1", "amount_g": 10},
+    )
+    assert not create.calls
+    assert "plan_id" in str(result)
 
 
 # ---------- update_log_item ----------
 
 
 @pytest.mark.asyncio
-async def test_update_log_item_patches_time() -> None:
+async def test_update_log_item_patches_time(monkeypatch: pytest.MonkeyPatch) -> None:
     """Correcting an entry's time in place — wger's web UI cannot do this."""
-    mcp, client = _register()
-    async with client:
-        with respx.mock(base_url=API) as router:
-            route = router.patch("/nutritiondiary/42/").respond(json={"id": 42})
-            await mcp.call_tool(
-                "update_log_item",
-                {"log_item_id": "42", "when": "2026-07-21T19:15:00+02:00"},
-            )
-    assert _sent(route) == {"datetime": "2026-07-21T19:15:00+02:00"}
+    mcp = _register()
+    update = _Capture(LOG_ITEM)
+    monkeypatch.setattr(nutrition.nutritiondiary_partial_update, "asyncio", update)
+    await mcp.call_tool(
+        "update_log_item",
+        {"log_item_id": LOG_ID, "when": "2026-07-21T19:15:00+02:00"},
+    )
+    assert update.calls[-1]["id"] == UUID(LOG_ID)
+    tz = timezone(timedelta(hours=2))
+    assert update.body.datetime_ == datetime(2026, 7, 21, 19, 15, tzinfo=tz)
+    assert update.body.amount is UNSET
 
 
 @pytest.mark.asyncio
-async def test_update_log_item_sends_only_given_fields() -> None:
-    mcp, client = _register()
-    async with client:
-        with respx.mock(base_url=API) as router:
-            route = router.patch("/nutritiondiary/7/").respond(json={"id": 7})
-            await mcp.call_tool("update_log_item", {"log_item_id": "7", "amount_g": 250})
-    assert _sent(route) == {"amount": 250.0}
+async def test_update_log_item_sends_only_given_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    mcp = _register()
+    update = _Capture(LOG_ITEM)
+    monkeypatch.setattr(nutrition.nutritiondiary_partial_update, "asyncio", update)
+    await mcp.call_tool("update_log_item", {"log_item_id": LOG_ID, "amount_g": 250})
+    assert update.body.to_dict() == {"amount": "250"}
 
 
 @pytest.mark.asyncio
-async def test_update_log_item_rejects_empty_patch() -> None:
-    mcp, client = _register()
-    async with client:
-        # assert_all_called=False: the point of this test is that the route is
-        # never reached.
-        with respx.mock(base_url=API, assert_all_called=False) as router:
-            route = router.patch("/nutritiondiary/7/").respond(json={})
-            result = await mcp.call_tool("update_log_item", {"log_item_id": "7"})
-    assert route.call_count == 0
+async def test_update_log_item_rejects_empty_patch(monkeypatch: pytest.MonkeyPatch) -> None:
+    mcp = _register()
+    update = _Capture(LOG_ITEM)
+    monkeypatch.setattr(nutrition.nutritiondiary_partial_update, "asyncio", update)
+    result = await mcp.call_tool("update_log_item", {"log_item_id": LOG_ID})
+    assert not update.calls
     assert "no fields to update" in str(result)

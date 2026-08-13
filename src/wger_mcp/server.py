@@ -17,6 +17,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from .api_client import build_api_client
 from .auth import (
     AS_METADATA_PATH,
     WELL_KNOWN_PATH,
@@ -46,8 +47,11 @@ def build_app(settings: Settings) -> Starlette:
         transport_security=transport_security,
     )
 
-    client = WgerClient(settings.wger_api_root, build_token_provider(settings))
-    register_all(mcp, client, settings)
+    # One token provider shared by both clients; WgerClient owns (and closes) it.
+    provider = build_token_provider(settings)
+    client = WgerClient(settings.wger_api_root, provider)
+    api = build_api_client(settings, provider)
+    register_all(mcp, client, api, settings)
 
     # AS facade: lets a client that treats this origin as the OAuth authorization
     # server (e.g. claude.ai) reach a private IdP. None when not in OIDC mode.
@@ -59,6 +63,7 @@ def build_app(settings: Settings) -> Starlette:
             try:
                 yield
             finally:
+                await api.get_async_httpx_client().aclose()
                 await client.aclose()
                 if as_facade is not None:
                     await as_facade.aclose()
@@ -112,9 +117,7 @@ def build_app(settings: Settings) -> Starlette:
             routes.append(
                 Route(settings.oauth_authorize_path, as_facade.authorize, methods=["GET"])
             )
-            routes.append(
-                Route(settings.oauth_token_path, as_facade.token, methods=["POST"])
-            )
+            routes.append(Route(settings.oauth_token_path, as_facade.token, methods=["POST"]))
     app = Starlette(routes=routes, lifespan=lifespan)
     app.router.redirect_slashes = False
     auth_cls, auth_kwargs = build_auth_middleware(settings)

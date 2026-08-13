@@ -19,6 +19,7 @@ dependencies = [
     "joserfc>=1.0",
     "starlette>=0.37",
     "uvicorn[standard]>=0.30",
+    "wger-api-client~=2.6",
 ]
 
 [project.scripts]
