@@ -37,6 +37,55 @@ def _unknown_kind(kind: str) -> dict[str, Any]:
 
 
 def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
+    # Exercise names live on translations, not on the exercise itself, and the
+    # plan endpoints carry only ids. Resolved here so callers get readable names
+    # without fetching a full exerciseinfo record per exercise. Cached for the
+    # process: exercise names are static content.
+    _name_cache: dict[int, str] = {}
+    _language_id: dict[str, int | None] = {}
+
+    async def _preferred_language_id() -> int | None:
+        """Map the configured language code to wger's numeric language id."""
+        code = settings.default_language
+        if code not in _language_id:
+            try:
+                rows = await client.paginate(
+                    "language/", params={"short_name": code}, limit=5
+                )
+                _language_id[code] = next(
+                    (r.get("id") for r in rows if isinstance(r, dict) and r.get("id")), None
+                )
+            except WgerError:
+                _language_id[code] = None
+        return _language_id[code]
+
+    async def _exercise_names(exercise_ids: set[int]) -> dict[int, str]:
+        wanted = {i for i in exercise_ids if i not in _name_cache}
+        if not wanted:
+            return {i: _name_cache[i] for i in exercise_ids if i in _name_cache}
+        language_id = await _preferred_language_id()
+
+        async def _one(exercise_id: int) -> None:
+            try:
+                rows = await client.paginate(
+                    "exercise-translation/", params={"exercise": exercise_id}, limit=50
+                )
+            except WgerError:
+                return  # a missing name must not fail the whole plan
+            named = [r for r in rows if isinstance(r, dict) and r.get("name")]
+            best = next(
+                (r["name"] for r in named if r.get("language") == language_id),
+                None,
+            )
+            # Fall back to any translation rather than returning a bare id.
+            if best is None and named:
+                best = named[0]["name"]
+            if best:
+                _name_cache[exercise_id] = best
+
+        await asyncio.gather(*[_one(i) for i in wanted])
+        return {i: _name_cache[i] for i in exercise_ids if i in _name_cache}
+
     @mcp.tool()
     async def list_routines(
         limit: Annotated[int, Field(ge=1, le=200)] = 20,
@@ -63,9 +112,14 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         """What the routine prescribes on a given date. Defaults to today.
 
         Returns the day's label, its iteration, and one entry per planned
-        exercise carrying slot_entry_id plus the planned sets, repetitions,
+        exercise: its name, slot_entry_id, and the planned sets, repetitions,
         weight and RiR. Feed routine_id, slot_entry_id and iteration straight
         into log_set so the logged set attaches to the plan.
+
+        This is the one call that answers "what am I doing today" and "what is
+        in this program". Reading the plan by walking days, slots, entries and
+        their configs costs dozens of requests and returns far more than anyone
+        needs.
 
         A rest day returns planned: [] with is_rest_day true.
         """
@@ -94,6 +148,11 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
                 for slot in entry.get("slots") or []
                 for cfg in slot.get("sets") or []
             ]
+            names = await _exercise_names(
+                {p["exercise_id"] for p in planned if p.get("exercise_id") is not None}
+            )
+            for p in planned:
+                p["exercise_name"] = names.get(p.get("exercise_id"))
             return {
                 "routine_id": routine_id,
                 "date": entry.get("date"),

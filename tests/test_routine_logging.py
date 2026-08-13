@@ -82,10 +82,28 @@ def _gym_sequence(day_date: str = TODAY, *, is_rest: bool = False) -> list[dict[
 # ---------- get_workout_for_date ----------
 
 
+def _mock_names(mock: Any) -> None:
+    """Names live on translations; the plan endpoints carry only ids."""
+    mock.get("/language/").respond(
+        json={"count": 1, "next": None, "results": [{"id": 2, "short_name": "en"}]}
+    )
+    mock.get("/exercise-translation/").respond(
+        json={
+            "count": 2,
+            "next": None,
+            "results": [
+                {"exercise": 73, "language": 1, "name": "Bankdrucken"},
+                {"exercise": 73, "language": 2, "name": "Bench Press"},
+            ],
+        }
+    )
+
+
 async def test_returns_slot_entry_ids_for_today() -> None:
     mcp = _register(routines)
     with respx.mock(base_url=API) as mock:
         mock.get("/routine/7/date-sequence-gym/").respond(json=_gym_sequence())
+        _mock_names(mock)
         out = _result(await mcp.call_tool("get_workout_for_date", {"routine_id": "7"}))
 
     assert out["iteration"] == 3
@@ -97,6 +115,8 @@ async def test_returns_slot_entry_ids_for_today() -> None:
     assert entry["slot_entry_id"] == 501
     assert entry["exercise_id"] == 73
     assert entry["repetitions"] == 5
+    # A name, not a bare id: reading the plan should not require a second lookup.
+    assert entry["exercise_name"] == "Bench Press"
 
 
 async def test_date_outside_the_routine_is_not_an_error() -> None:
