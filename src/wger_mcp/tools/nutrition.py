@@ -1,10 +1,7 @@
-"""Nutrition plan / meal / diary tools.
+"""Nutrition plan / meal / diary tools, via the generated ``wger_api_client``.
 
-First module ported to the generated ``wger_api_client``: endpoint paths,
-request models and filter parameters are typed against wger's OpenAPI schema
-instead of hand-written (see ``api_client.py``). Tool names, arguments and
-response shapes are unchanged; resource ids stay opaque strings at the tool
-boundary (ADR 0002) and are parsed into the client's id types internally.
+Resource ids stay opaque strings at the tool boundary (ADR 0002); they are
+parsed into the client's id types internally.
 """
 
 from __future__ import annotations
@@ -93,17 +90,12 @@ def _amount(value: float) -> str:
 async def _post_userprofile(
     api: AuthenticatedClient, body: api_models.UserprofileRequest
 ) -> dict[str, Any]:
-    """Update the caller's profile via POST /userprofile/.
-
-    wger answers with 200 (the POST updates the existing profile), but client
-    releases up to 2.6.0 were generated from a schema that documented the
-    default 201, so they treat the reply as unexpected. Tolerate that until a
-    client built from the fixed schema ships, then inline the plain call.
-    """
+    """Update the caller's profile via POST /userprofile/."""
     try:
         updated = await userprofile_create.asyncio(client=api, body=body)
         return updated.to_dict()
     except UnexpectedStatus as exc:
+        # wger answers 200, clients <= 2.6.0 only know the schema's 201
         if exc.status_code == 200:
             return json.loads(exc.content)
         raise
@@ -459,7 +451,7 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
                     age = profile.age
                     source["age"] = "userprofile"
                 if sex is None:
-                    gender = getattr(profile.gender, "value", None)
+                    gender = profile.gender if isinstance(profile.gender, str) else None
                     if gender == "1":
                         sex = "male"
                         source["sex"] = "userprofile"
@@ -560,32 +552,25 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     ) -> dict[str, Any]:
         """Update the wger user profile. gender: '1'=male, '2'=female.
         intensity fields: '1'=low, '2'=moderate, '3'=high."""
+        # gender/intensity are Literal types in the client; the Field patterns
+        # above already restrict the values, so the strings pass through as-is
         body = api_models.UserprofileRequest(
             calories=calories if calories is not None else UNSET,
             height=height_cm if height_cm is not None else UNSET,
             birthdate=birthdate if birthdate is not None else UNSET,
-            gender=api_models.GenderEnum(gender) if gender is not None else UNSET,
+            gender=gender if gender is not None else UNSET,
             sleep_hours=sleep_hours if sleep_hours is not None else UNSET,
             work_hours=work_hours if work_hours is not None else UNSET,
-            work_intensity=(
-                api_models.IntensityEnum(work_intensity) if work_intensity is not None else UNSET
-            ),
+            work_intensity=work_intensity if work_intensity is not None else UNSET,
             sport_hours=sport_hours if sport_hours is not None else UNSET,
-            sport_intensity=(
-                api_models.IntensityEnum(sport_intensity) if sport_intensity is not None else UNSET
-            ),
+            sport_intensity=sport_intensity if sport_intensity is not None else UNSET,
             freetime_hours=freetime_hours if freetime_hours is not None else UNSET,
-            freetime_intensity=(
-                api_models.IntensityEnum(freetime_intensity)
-                if freetime_intensity is not None
-                else UNSET
-            ),
+            freetime_intensity=freetime_intensity if freetime_intensity is not None else UNSET,
         )
         if not body.to_dict():
             return bad_request("no fields to update")
         try:
-            # wger updates the profile of the calling user via POST on the
-            # collection; PATCH only exists on the (unknowable) detail route.
+            # profile updates go via POST on the collection, not PATCH
             return await _post_userprofile(api, body)
         except UnexpectedStatus as exc:
             return api_err(exc)

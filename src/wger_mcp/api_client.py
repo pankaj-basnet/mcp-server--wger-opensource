@@ -1,19 +1,9 @@
 """Bridge between the generated ``wger_api_client`` and this server's auth.
 
-The generated :class:`~wger_api_client.client.AuthenticatedClient` expects one
-fixed token, but this server resolves the outbound wger credential *per
-request* from the caller's identity (see ``auth/exchange.py``). The bridge is
-an :class:`httpx.Auth` that asks the :class:`WgerTokenProvider` for the
-``Authorization`` header on every request, injected via
-``set_async_httpx_client`` so all requests share one connection pool.
-
-Also provides the two helpers the tool modules need on top of the generated
-functions: offset pagination over ``*_list`` endpoints and shaping
-:class:`~wger_api_client.errors.UnexpectedStatus` into the error dict the
-tools return (same shape as ``tools.common.err``).
-
-Tool modules are being migrated from the hand-written ``wger_client`` to this
-typed client one by one; both coexist until the migration is complete.
+The generated client expects one fixed token; here the ``Authorization``
+header is resolved per request from the caller's identity instead (see
+``auth/exchange.py``), so one shared client serves all users. Plus the two
+helpers the tool modules need: offset pagination and error shaping.
 """
 
 from __future__ import annotations
@@ -34,11 +24,7 @@ _PAGE_LIMIT = 100
 
 
 class _ProviderAuth(httpx.Auth):
-    """Resolves the Authorization header per request from the token provider.
-
-    The provider reads the caller's identity off the request context, so the
-    header differs between concurrent requests of different users.
-    """
+    """Resolves the Authorization header per request from the token provider."""
 
     def __init__(self, provider: WgerTokenProvider) -> None:
         self._provider = provider
@@ -51,11 +37,7 @@ class _ProviderAuth(httpx.Auth):
 
 
 def build_api_client(settings: Settings, provider: WgerTokenProvider) -> AuthenticatedClient:
-    """One shared typed client; auth is per-request via ``_ProviderAuth``.
-
-    The ``token`` attribute is never sent — ``set_async_httpx_client`` replaces
-    the client the generated code would otherwise build from it.
-    """
+    """One shared typed client; auth is per-request via ``_ProviderAuth``."""
     base_url = str(settings.wger_base_url).rstrip("/")
     api = AuthenticatedClient(
         base_url=base_url,
@@ -97,12 +79,7 @@ async def paginate(
     limit: int,
     **filters: Any,
 ) -> list[dict[str, Any]]:
-    """Collect up to ``limit`` items from a generated ``*_list.asyncio``.
-
-    Requests ``limit`` directly (the server caps a page at its own maximum)
-    and follows with offset requests while the server returns fewer items
-    than asked for but reports more available.
-    """
+    """Collect up to ``limit`` items from a generated ``*_list.asyncio``."""
     results: list[dict[str, Any]] = []
     while len(results) < limit:
         page = await list_fn(

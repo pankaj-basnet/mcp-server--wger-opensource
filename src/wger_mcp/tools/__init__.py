@@ -1,12 +1,8 @@
 """MCP tool modules, grouped by domain.
 
-Each module exposes a ``register(mcp, <client>, settings)`` function that
-attaches its tools to the given FastMCP instance; ``server.build_app`` calls
-them all. Modules that need no configuration simply ignore ``settings``.
-
-Modules are being migrated from the hand-written ``WgerClient`` to the typed
-``wger_api_client`` (see ``api_client.py``); migrated ones take the
-``AuthenticatedClient`` instead.
+Each module exposes a ``register(mcp, <client>, settings)`` function;
+``server.build_app`` calls them all. Migrated modules take the typed
+``AuthenticatedClient``, the rest still the hand-written ``WgerClient``.
 """
 
 from __future__ import annotations
@@ -31,7 +27,6 @@ from . import (
 
 _REGISTRARS = (
     profile.register,
-    routines.register,
     workout_logs.register,
     body_weight.register,
     measurements.register,
@@ -41,7 +36,10 @@ _REGISTRARS = (
     off.register,
 )
 
-_TYPED_REGISTRARS = (nutrition.register,)
+_TYPED_REGISTRARS = (
+    routines.register,
+    nutrition.register,
+)
 
 
 def register_all(
