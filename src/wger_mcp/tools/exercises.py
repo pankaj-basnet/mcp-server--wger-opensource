@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -14,22 +15,84 @@ from .common import bad_request, err
 _NUTRISCORE = r"^[A-Ea-e]$"
 
 
-def _shape_images(images: Any) -> list[dict[str, Any]]:
-    """Flatten an exercise's images, surfacing the 2.6 small/medium thumbnails."""
-    out: list[dict[str, Any]] = []
-    for img in images or []:
-        if not isinstance(img, dict):
-            continue
-        out.append({
-            "image": img.get("image"),
-            "is_main": img.get("is_main"),
-            "thumbnails": img.get("thumbnails"),
-        })
-    return out
+# wger's search is one request per name. Filling a training day means a dozen
+# of them, so the batch tool runs them concurrently — same cap as the Open Food
+# Facts batch lookup.
+_BATCH_CONCURRENCY = 4
+
+# How many candidates to pull before ranking locally. Bandwidth is cheap; the
+# caller's context is not, so only the top few survive.
+_RANK_POOL = 20
+
+
+def _relevance(name: str, query: str) -> tuple[int, int]:
+    """How well a name answers a query: matched words first, then brevity.
+
+    wger's name__search matches any single word, so "incline barbell bench press"
+    ranks a plain "Bench Press" alongside the incline variant. Counting how many
+    of the query's words the name actually contains puts the specific match
+    first; shorter names break ties, so "Bench Press" still beats "Bench Press
+    Narrow Grip" for the query "bench press".
+    """
+    lowered = (name or "").lower()
+    hits = sum(1 for word in query.lower().split() if word in lowered)
+    return (-hits, len(lowered))
 
 
 def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
     default_language = settings.default_language
+    # exerciseinfo filters WHICH exercises match a language, but each one still
+    # carries every translation. Picking the wrong one hands the caller a name in
+    # a language it did not ask for, so resolve the code to wger's numeric id and
+    # prefer that translation. Cached: the language table is static.
+    _language_id: dict[str, int | None] = {}
+
+    async def _language_id_for(code: str) -> int | None:
+        if code not in _language_id:
+            try:
+                rows = await client.paginate(
+                    "language/", params={"short_name": code}, limit=5
+                )
+                _language_id[code] = next(
+                    (r.get("id") for r in rows if isinstance(r, dict) and r.get("id")), None
+                )
+            except WgerError:
+                _language_id[code] = None
+        return _language_id[code]
+
+    async def _search(query: str, lang: str, limit: int) -> list[dict[str, Any]]:
+        """One name-search, shaped down to what picks an exercise."""
+        language_id = await _language_id_for(lang)
+        # Fetch wider than asked for, rank locally, then trim: the extra rows cost
+        # a little bandwidth and no context, and wger's own ordering buries the
+        # exact match behind looser ones.
+        results = await client.paginate(
+            "exerciseinfo/",
+            params={"name__search": query, "language__code": lang},
+            limit=max(limit, _RANK_POOL),
+        )
+        q_lower = query.lower()
+        shaped: list[dict[str, Any]] = []
+        for ex in results:
+            if not isinstance(ex, dict):
+                continue
+            translations = [
+                t for t in (ex.get("translations") or []) if isinstance(t, dict) and t.get("name")
+            ]
+            in_language = [t for t in translations if t.get("language") == language_id]
+            pool = in_language or translations
+            match = next(
+                (t for t in pool if q_lower in (t.get("name") or "").lower()),
+                pool[0] if pool else None,
+            )
+            shaped.append({
+                "id": ex.get("id"),
+                "name": (match or {}).get("name"),
+                "category": (ex.get("category") or {}).get("name"),
+                "equipment": [e.get("name") for e in (ex.get("equipment") or [])],
+            })
+        shaped.sort(key=lambda s: _relevance(s.get("name") or "", query))
+        return shaped[:limit]
 
     @mcp.tool()
     async def search_exercises(
@@ -39,44 +102,48 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
     ) -> list[dict[str, Any]]:
         """Search the wger exercise database by name.
 
+        Returns id, name, category and equipment — enough to pick an exercise.
+        Call get_exercise for images, translations and the full record.
+
         ``language`` is an ISO 639-1 code ('en', 'pl', 'de', ...); it defaults to
         the server's ``DEFAULT_LANGUAGE``.
         """
         try:
-            results = await client.paginate(
-                "exerciseinfo/",
-                params={
-                    "name__search": query,
-                    "language__code": language or default_language,
-                },
-                limit=limit,
-            )
+            return await _search(query, language or default_language, limit)
         except WgerError as exc:
             return [err(exc)]
-        q_lower = query.lower()
-        shaped: list[dict[str, Any]] = []
-        for ex in results:
-            if not isinstance(ex, dict):
-                continue
-            translations = [
-                t for t in (ex.get("translations") or []) if isinstance(t, dict) and t.get("name")
-            ]
-            match = next(
-                (t for t in translations if q_lower in (t.get("name") or "").lower()),
-                translations[0] if translations else None,
-            )
-            shaped.append({
-                "id": ex.get("id"),
-                "uuid": ex.get("uuid"),
-                "name": (match or {}).get("name"),
-                "category": (ex.get("category") or {}).get("name"),
-                "equipment": [e.get("name") for e in (ex.get("equipment") or [])],
-                "images": _shape_images(ex.get("images")),
-                "translations": [
-                    {"language": t.get("language"), "name": t.get("name")} for t in translations
-                ],
-            })
-        return shaped
+
+    @mcp.tool()
+    async def search_exercises_batch(
+        queries: list[str],
+        language: Annotated[str | None, Field(pattern=r"^[a-z]{2}$")] = None,
+        limit_per_query: Annotated[int, Field(ge=1, le=10)] = 2,
+    ) -> dict[str, Any]:
+        """Batch variant: resolve many exercise names at once.
+
+        Returns a map keyed by query, each holding the top matches in the same
+        shape as search_exercises. Fetches run concurrently (capped at 4 in
+        flight) and duplicate queries are collapsed.
+
+        Use this when building or filling a training day. Searching one name per
+        call costs an inference round trip per exercise, which is the difference
+        between filling a day in one turn and running out of them.
+        """
+        if not queries:
+            return {"count": 0, "results": {}}
+        lang = language or default_language
+        unique = list(dict.fromkeys(q for q in queries if q and len(q) >= 2))
+        sem = asyncio.Semaphore(_BATCH_CONCURRENCY)
+
+        async def _one(q: str) -> tuple[str, Any]:
+            async with sem:
+                try:
+                    return q, await _search(q, lang, limit_per_query)
+                except WgerError as exc:
+                    return q, [err(exc)]
+
+        results = dict(await asyncio.gather(*[_one(q) for q in unique]))
+        return {"count": len(results), "results": results}
 
     @mcp.tool()
     async def get_exercise(exercise_id: str) -> dict[str, Any]:
@@ -224,6 +291,7 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
             results = await client.paginate("exerciseinfo/", params=params, limit=limit)
         except WgerError as exc:
             return [err(exc)]
+        language_id = await _language_id_for(params["language__code"])
         shaped: list[dict[str, Any]] = []
         for ex in results:
             if not isinstance(ex, dict):
@@ -231,10 +299,13 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
             translations = [
                 t for t in (ex.get("translations") or []) if isinstance(t, dict) and t.get("name")
             ]
+            # Same rule as search_exercises: never hand back a name in a language
+            # the caller did not ask for when one in that language exists.
+            in_language = [t for t in translations if t.get("language") == language_id]
+            pool = in_language or translations
             shaped.append({
                 "id": ex.get("id"),
-                "uuid": ex.get("uuid"),
-                "name": (translations[0].get("name") if translations else None),
+                "name": (pool[0].get("name") if pool else None),
                 "category": (ex.get("category") or {}).get("name"),
                 "equipment": [e.get("name") for e in (ex.get("equipment") or [])],
                 "muscles": [m.get("name") for m in (ex.get("muscles") or [])],
