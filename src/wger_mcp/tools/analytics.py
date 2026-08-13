@@ -12,7 +12,7 @@ from typing import Annotated, Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
-from wger_api_client.api.exerciseinfo import exerciseinfo_retrieve
+from wger_api_client.api.exerciseinfo import exerciseinfo_list
 from wger_api_client.api.workoutlog import workoutlog_list
 from wger_api_client.client import AuthenticatedClient
 from wger_api_client.errors import UnexpectedStatus
@@ -27,9 +27,8 @@ GROUP_BY_OPTIONS: tuple[str, ...] = ("none", "exercise", "muscle", "category")
 # Exercise metadata (name/category/muscles) is effectively static per wger
 # deployment; cache it process-wide across tool invocations.
 _EX_META_CACHE: dict[int, dict[str, Any]] = {}
-# Fetched one by one: the generated client sends id__in as repeated query
-# parameters, of which wger only applies the last one
-_EX_META_CONCURRENCY = 8
+# Ids per request, so that a long history does not build an unwieldy URL
+_EX_META_BATCH = 100
 
 
 def _epley(weight: float, reps: int) -> float:
@@ -81,22 +80,20 @@ async def _load_ex_meta(
         if isinstance(eid, int):
             ex_ids.add(eid)
     missing = [eid for eid in ex_ids if eid not in _EX_META_CACHE]
-    if missing:
-        sem = asyncio.Semaphore(_EX_META_CONCURRENCY)
 
-        async def _fetch(eid: int) -> tuple[int, dict[str, Any] | None]:
-            async with sem:
-                try:
-                    meta = await exerciseinfo_retrieve.asyncio(id=eid, client=api)
-                    return eid, meta.to_dict()
-                except (UnexpectedStatus, httpx.HTTPError):
-                    return eid, None
+    async def _fetch(ids: list[int]) -> list[dict[str, Any]]:
+        try:
+            return await paginate(exerciseinfo_list.asyncio, client=api, limit=len(ids), id_in=ids)
+        except (UnexpectedStatus, httpx.HTTPError):
+            return []
 
-        # A failed lookup stays uncached, so a transient error is retried on the
-        # next call instead of being remembered as "this exercise has no data"
-        for eid, meta in await asyncio.gather(*[_fetch(e) for e in missing]):
-            if meta is not None:
-                _EX_META_CACHE[eid] = meta
+    batches = [missing[i : i + _EX_META_BATCH] for i in range(0, len(missing), _EX_META_BATCH)]
+    # A failed lookup stays uncached, so a transient error is retried on the
+    # next call instead of being remembered as "this exercise has no data"
+    for metas in await asyncio.gather(*[_fetch(b) for b in batches]):
+        for meta in metas:
+            if isinstance(meta.get("id"), int):
+                _EX_META_CACHE[meta["id"]] = meta
     return {eid: _EX_META_CACHE[eid] for eid in ex_ids if eid in _EX_META_CACHE}
 
 
