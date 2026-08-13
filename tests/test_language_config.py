@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ import respx
 from mcp.server.fastmcp import FastMCP
 from pydantic import ValidationError
 
+from wger_mcp.api_client import build_api_client
 from wger_mcp.config import Settings
 from wger_mcp.tools import exercises, off
 from wger_mcp.wger_client import WgerClient
@@ -150,9 +152,7 @@ async def test_lookup_uses_configured_default_language() -> None:
             route = router.get("/api/v2/product/5901234123457.json").respond(
                 json={"status": 1, "product": _product(product_name_fr="Chocolat noir")}
             )
-            raw = await mcp.call_tool(
-                "lookup_food_by_barcode", {"barcode": "5901234123457"}
-            )
+            raw = await mcp.call_tool("lookup_food_by_barcode", {"barcode": "5901234123457"})
     assert "product_name_fr" in route.calls.last.request.url.params["fields"]
     result = _first_result(raw)
     assert result["language"] == "fr"
@@ -185,19 +185,28 @@ async def test_batch_lookup_threads_language() -> None:
             route = router.get("/api/v2/product/5901234123457.json").respond(
                 json={"status": 1, "product": _product(product_name_es="Chocolate negro")}
             )
-            raw = await mcp.call_tool(
-                "lookup_foods_by_barcodes", {"barcodes": ["5901234123457"]}
-            )
+            raw = await mcp.call_tool("lookup_foods_by_barcodes", {"barcodes": ["5901234123457"]})
     assert "product_name_es" in route.calls.last.request.url.params["fields"]
     result = _first_result(raw)
     assert result["results"]["5901234123457"]["name"] == "Chocolate negro"
 
 
-def _register_exercises(settings: Settings) -> tuple[FastMCP, WgerClient]:
+def _register_exercises(settings: Settings) -> FastMCP:
     mcp = FastMCP("test")
-    client = WgerClient(WGER_API, _StubProvider())
-    exercises.register(mcp, client, settings)
-    return mcp, client
+    api = build_api_client(settings, _StubProvider())
+    exercises.register(mcp, api, settings)
+    return mcp
+
+
+class _CaptureList:
+    """Stands in for a generated ``*_list.asyncio``; records its kwargs."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return SimpleNamespace(count=0, results=[])
 
 
 @pytest.mark.asyncio
@@ -206,14 +215,13 @@ def _register_exercises(settings: Settings) -> tuple[FastMCP, WgerClient]:
     [("en", None, "en"), ("de", None, "de"), ("de", "pl", "pl")],
 )
 async def test_exercise_search_language_resolution(
-    configured: str, passed: str | None, expected: str
+    monkeypatch: pytest.MonkeyPatch, configured: str, passed: str | None, expected: str
 ) -> None:
-    mcp, client = _register_exercises(_settings(default_language=configured))
+    mcp = _register_exercises(_settings(default_language=configured))
+    listing = _CaptureList()
+    monkeypatch.setattr(exercises.exerciseinfo_list, "asyncio", listing)
     args: dict[str, Any] = {"query": "squat"}
     if passed is not None:
         args["language"] = passed
-    async with client:
-        with respx.mock(base_url=WGER_API) as router:
-            route = router.get("/exerciseinfo/").respond(json={"results": [], "next": None})
-            await mcp.call_tool("search_exercises", args)
-    assert route.calls.last.request.url.params["language__code"] == expected
+    await mcp.call_tool("search_exercises", args)
+    assert listing.calls[-1]["language_code"] == expected

@@ -25,20 +25,20 @@ from . import (
     workout_logs,
 )
 
-_REGISTRARS = (
+# off talks to Open Food Facts directly and only borrows the WgerClient's
+# shutdown hook; everything wger-facing uses the typed client.
+_REGISTRARS = (off.register,)
+
+_TYPED_REGISTRARS = (
     profile.register,
+    routines.register,
     workout_logs.register,
     body_weight.register,
     measurements.register,
     equipment.register,
+    nutrition.register,
     exercises.register,
     analytics.register,
-    off.register,
-)
-
-_TYPED_REGISTRARS = (
-    routines.register,
-    nutrition.register,
 )
 
 

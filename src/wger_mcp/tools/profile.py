@@ -1,21 +1,24 @@
-"""User-profile tools."""
+"""User-profile tools, via the generated ``wger_api_client``."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from wger_api_client.api.userprofile import userprofile_list
+from wger_api_client.client import AuthenticatedClient
+from wger_api_client.errors import UnexpectedStatus
 
+from ..api_client import api_err
 from ..config import Settings
-from ..wger_client import WgerClient, WgerError
-from .common import err
 
 
-def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
+def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None:
     @mcp.tool()
     async def whoami() -> dict[str, Any]:
         """Return the wger user profile of the authenticated caller."""
         try:
-            return await client.get("userprofile/")
-        except WgerError as exc:
-            return err(exc)
+            profile = await userprofile_list.asyncio(client=api)
+            return profile.to_dict()
+        except UnexpectedStatus as exc:
+            return api_err(exc)

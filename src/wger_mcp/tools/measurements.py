@@ -1,19 +1,50 @@
-"""Body measurement tracking tools (categories + entries)."""
+"""Body measurement tools (categories + entries), via the generated
+``wger_api_client``."""
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time
 from typing import Annotated, Any
+from uuid import UUID
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
+from wger_api_client import models as api_models
+from wger_api_client.api.measurement import (
+    measurement_create,
+    measurement_destroy,
+    measurement_list,
+    measurement_partial_update,
+    measurement_retrieve,
+)
+from wger_api_client.api.measurement_category import (
+    measurement_category_create,
+    measurement_category_destroy,
+    measurement_category_list,
+    measurement_category_partial_update,
+    measurement_category_retrieve,
+)
+from wger_api_client.client import AuthenticatedClient
+from wger_api_client.errors import UnexpectedStatus
+from wger_api_client.types import UNSET
 
+from ..api_client import api_err, paginate
 from ..config import Settings
-from ..wger_client import WgerClient, WgerError
-from .common import bad_request, err
+from .common import bad_request
+
+# Bare dates land at noon so the entry stays on the intended day across
+# timezone shifts.
+_BARE_DATE_TIME = time(12, 0)
 
 
-def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
+def _uuid(value: str, field: str) -> UUID:
+    try:
+        return UUID(value)
+    except ValueError:
+        raise ValueError(f"{field} must be a UUID, got {value!r}") from None
+
+
+def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None:
     # ── Categories ──────────────────────────────────────────────────────────
 
     @mcp.tool()
@@ -22,56 +53,72 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
     ) -> list[dict[str, Any]]:
         """List all body measurement categories (e.g. Waist, Chest, Bicep)."""
         try:
-            return await client.paginate("measurement-category/", limit=limit)
-        except WgerError as exc:
-            return [err(exc)]
+            return await paginate(measurement_category_list.asyncio, client=api, limit=limit)
+        except UnexpectedStatus as exc:
+            return [api_err(exc)]
 
     @mcp.tool()
     async def create_measurement_category(
         name: Annotated[str, Field(min_length=1, max_length=100)],
-        unit: Annotated[str, Field(min_length=1, max_length=10)] = "cm",
+        unit: Annotated[str, Field(min_length=1, max_length=30)] = "cm",
     ) -> dict[str, Any]:
         """Create a body measurement category (e.g. name='Bicep', unit='cm')."""
         try:
-            return await client.post("measurement-category/", json={"name": name, "unit": unit})
-        except WgerError as exc:
-            return err(exc)
+            created = await measurement_category_create.asyncio(
+                client=api, body=api_models.CategoryRequest(name=name, unit=unit)
+            )
+            return created.to_dict()
+        except UnexpectedStatus as exc:
+            return api_err(exc)
 
     @mcp.tool()
     async def get_measurement_category(category_id: str) -> dict[str, Any]:
         """Fetch a single measurement category by ID."""
         try:
-            return await client.get(f"measurement-category/{category_id}/")
-        except WgerError as exc:
-            return err(exc)
+            category = await measurement_category_retrieve.asyncio(
+                id=_uuid(category_id, "category_id"), client=api
+            )
+            return category.to_dict()
+        except UnexpectedStatus as exc:
+            return api_err(exc)
+        except ValueError as exc:
+            return bad_request(str(exc))
 
     @mcp.tool()
     async def update_measurement_category(
         category_id: str,
         name: str | None = None,
-        unit: Annotated[str | None, Field(max_length=10)] = None,
+        unit: Annotated[str | None, Field(max_length=30)] = None,
     ) -> dict[str, Any]:
         """Rename or change the unit of a measurement category."""
-        payload: dict[str, Any] = {}
-        if name is not None:
-            payload["name"] = name
-        if unit is not None:
-            payload["unit"] = unit
-        if not payload:
+        body = api_models.PatchedCategoryRequest(
+            name=name if name is not None else UNSET,
+            unit=unit if unit is not None else UNSET,
+        )
+        if not body.to_dict():
             return bad_request("no fields to update")
         try:
-            return await client.patch(f"measurement-category/{category_id}/", json=payload)
-        except WgerError as exc:
-            return err(exc)
+            updated = await measurement_category_partial_update.asyncio(
+                id=_uuid(category_id, "category_id"), client=api, body=body
+            )
+            return updated.to_dict()
+        except UnexpectedStatus as exc:
+            return api_err(exc)
+        except ValueError as exc:
+            return bad_request(str(exc))
 
     @mcp.tool()
     async def delete_measurement_category(category_id: str) -> dict[str, Any]:
         """Delete a measurement category and all its entries."""
         try:
-            await client.delete(f"measurement-category/{category_id}/")
+            await measurement_category_destroy.asyncio_detailed(
+                id=_uuid(category_id, "category_id"), client=api
+            )
             return {"deleted": True, "category_id": category_id}
-        except WgerError as exc:
-            return err(exc)
+        except UnexpectedStatus as exc:
+            return api_err(exc)
+        except ValueError as exc:
+            return bad_request(str(exc))
 
     # ── Entries ──────────────────────────────────────────────────────────────
 
@@ -81,69 +128,99 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         limit: Annotated[int, Field(ge=1, le=500)] = 100,
     ) -> list[dict[str, Any]]:
         """List body measurement entries, optionally filtered by category."""
-        params: dict[str, Any] = {"ordering": "-date"}
+        filters: dict[str, Any] = {"ordering": "-date"}
         if category_id is not None:
-            params["category"] = category_id
+            try:
+                filters["category"] = _uuid(category_id, "category_id")
+            except ValueError as exc:
+                return [bad_request(str(exc))]
         try:
-            return await client.paginate("measurement/", params=params, limit=limit)
-        except WgerError as exc:
-            return [err(exc)]
+            return await paginate(measurement_list.asyncio, client=api, limit=limit, **filters)
+        except UnexpectedStatus as exc:
+            return [api_err(exc)]
 
     @mcp.tool()
     async def log_measurement(
         category_id: str,
         value: Annotated[float, Field(gt=0)],
-        when: date | None = None,
+        when: date | datetime | None = None,
         notes: str | None = None,
     ) -> dict[str, Any]:
-        """Add a body measurement entry to a category."""
-        payload: dict[str, Any] = {
-            "category": category_id,
-            "value": value,
-            "date": (when or date.today()).isoformat(),
-        }
-        if notes is not None:
-            payload["notes"] = notes
+        """Add a body measurement entry to a category. Defaults to now; a bare
+        date lands at 12:00."""
         try:
-            return await client.post("measurement/", json=payload)
-        except WgerError as exc:
-            return err(exc)
+            body = api_models.MeasurementRequest(
+                category=_uuid(category_id, "category_id"),
+                value=value,
+                date=(
+                    when
+                    if isinstance(when, datetime)
+                    else datetime.combine(when, _BARE_DATE_TIME)
+                    if when is not None
+                    else UNSET
+                ),
+                notes=notes if notes is not None else UNSET,
+            )
+            created = await measurement_create.asyncio(client=api, body=body)
+            return created.to_dict()
+        except UnexpectedStatus as exc:
+            return api_err(exc)
+        except ValueError as exc:
+            return bad_request(str(exc))
 
     @mcp.tool()
     async def get_measurement(measurement_id: str) -> dict[str, Any]:
         """Fetch a single body measurement entry by ID."""
         try:
-            return await client.get(f"measurement/{measurement_id}/")
-        except WgerError as exc:
-            return err(exc)
+            entry = await measurement_retrieve.asyncio(
+                id=_uuid(measurement_id, "measurement_id"), client=api
+            )
+            return entry.to_dict()
+        except UnexpectedStatus as exc:
+            return api_err(exc)
+        except ValueError as exc:
+            return bad_request(str(exc))
 
     @mcp.tool()
     async def update_measurement(
         measurement_id: str,
         value: Annotated[float | None, Field(gt=0)] = None,
-        when: date | None = None,
+        when: date | datetime | None = None,
         notes: str | None = None,
     ) -> dict[str, Any]:
         """Patch a body measurement entry."""
-        payload: dict[str, Any] = {}
-        if value is not None:
-            payload["value"] = value
-        if when is not None:
-            payload["date"] = when.isoformat()
-        if notes is not None:
-            payload["notes"] = notes
-        if not payload:
+        body = api_models.PatchedMeasurementRequest(
+            value=value if value is not None else UNSET,
+            date=(
+                when
+                if isinstance(when, datetime)
+                else datetime.combine(when, _BARE_DATE_TIME)
+                if when is not None
+                else UNSET
+            ),
+            notes=notes if notes is not None else UNSET,
+        )
+        if not body.to_dict():
             return bad_request("no fields to update")
         try:
-            return await client.patch(f"measurement/{measurement_id}/", json=payload)
-        except WgerError as exc:
-            return err(exc)
+            updated = await measurement_partial_update.asyncio(
+                id=_uuid(measurement_id, "measurement_id"), client=api, body=body
+            )
+            return updated.to_dict()
+        except UnexpectedStatus as exc:
+            return api_err(exc)
+        except ValueError as exc:
+            return bad_request(str(exc))
 
     @mcp.tool()
     async def delete_measurement(measurement_id: str) -> dict[str, Any]:
         """Delete a body measurement entry."""
         try:
-            await client.delete(f"measurement/{measurement_id}/")
+            await measurement_destroy.asyncio_detailed(
+                id=_uuid(measurement_id, "measurement_id"), client=api
+            )
             return {"deleted": True, "measurement_id": measurement_id}
-        except WgerError as exc:
-            return err(exc)
+        except UnexpectedStatus as exc:
+            return api_err(exc)
+        except ValueError as exc:
+            return bad_request(str(exc))
