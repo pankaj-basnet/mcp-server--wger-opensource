@@ -150,6 +150,18 @@ Safe only when bound to localhost for local development. Never expose it to a ne
 
 Tools are grouped by domain. Each lives in its own module under [`src/wger_mcp/tools/`](src/wger_mcp/tools/).
 
+### Registering only some groups
+
+All 78 tools are registered by default. `MCP_TOOLS` narrows that to a comma-separated list of groups:
+
+```bash
+MCP_TOOLS=nutrition,off,profile     # a food-logging agent
+```
+
+Valid group names are the module names: `profile`, `routines`, `workout_logs`, `body_weight`, `measurements`, `equipment`, `nutrition`, `exercises`, `analytics`, `off`. An unknown name stops the server at startup rather than silently dropping tools, and repeated names are harmless.
+
+This matters most for agents driven by small local models, whose tool-selection accuracy falls off as the surface grows, and where every schema is spent from a modest context window. It is also useful for a single-purpose agent that has no business writing routines.
+
 ### Profile
 
 | Tool | Description |
@@ -167,24 +179,23 @@ Tools are grouped by domain. Each lives in its own module under [`src/wger_mcp/t
 | `list_routine_days(routine_id)` / `get_routine_day(day_id)` | Read day structure |
 | `add_routine_day(routine_id, name, order, description?, is_rest?, day_type?)` | Add a training day |
 | `update_routine_day(day_id, ...)` / `delete_routine_day(day_id)` | Patch / delete a day (cascade) |
-| `list_slots(day_id)` / `add_slot_to_day(day_id, order, sets?, rest_seconds?)` | List / add exercise slots |
+| `list_slots(day_id)` / `add_slot_to_day(day_id, order, comment?)` | List / add exercise slots |
 | `update_slot(slot_id, ...)` / `delete_slot(slot_id)` | Patch / delete a slot (cascade) |
 | `list_slot_entries(slot_id)` / `get_slot_entry(entry_id)` | Read exercise entries in a slot |
 | `attach_exercise_to_slot(slot_id, exercise_id, order?, repetition_unit?, weight_unit?, comment?)` | Bind an exercise to a slot |
-| `update_slot_entry(entry_id, ...)` / `delete_slot_entry(entry_id)` | Patch / delete a slot entry |
+| `update_slot_entry(slot_entry_id, ...)` / `delete_slot_entry(slot_entry_id)` | Patch / delete a slot entry |
 | `list_slot_entry_configs(slot_entry_id, kinds?)` | Read per-iteration configs (sets/reps/weight/rir/rest/max_*) |
-| `set_slot_entry_config(slot_entry_id, kind, value, iteration?, operation?, step?, repeat?)` | Add a per-iteration config record |
+| `set_slot_entry_config(slot_entry_id, kind, value, iteration?, operation?, step?, repeat?, weight_unit?)` | Add a per-iteration config record. `weight_unit` applies to `kind='weight'`/`'max_weight'` and is recorded on the slot entry |
 | `update_slot_entry_config(kind, config_id, value?, iteration?, ...)` / `delete_slot_entry_config(kind, config_id)` | Patch / delete a config record (use to bump weight on progression) |
-| `add_exercise_with_sets(day_id, exercise_id, sets, reps, weight_kg, slot_order?, rest_seconds?)` | Convenience: slot + entry + sets/reps/weight configs in one call |
-| `list_workouts` | Legacy workout plans |
+| `add_exercise_with_sets(day_id, exercise_id, sets, reps, weight?, slot_order?, weight_unit?, rir?)` | Convenience: slot + entry + sets/reps configs in one call. Omit `weight` to prescribe sets without a load |
 
 ### Workout logs
 
 | Tool | Description |
 |------|-------------|
-| `log_set(exercise_id, reps, weight_kg, workout_log_date?, rir?)` | Add a workout log entry |
+| `log_set(exercise_id, reps, weight, workout_log_date?, rir?, weight_unit?)` | Add a workout log entry. `weight_unit` is `kg` (default) or `lb`; the weight is stored in the unit given, with no conversion |
 | `list_workout_logs(date_from?, date_to?, exercise_id?, limit?)` / `get_workout_log(log_id)` | Read entries |
-| `update_workout_log(log_id, ...)` / `delete_workout_log(log_id)` | Edit / remove an entry |
+| `update_workout_log(log_id, reps?, weight?, rir?, when?, weight_unit?)` / `delete_workout_log(log_id)` | Edit / remove an entry |
 
 ### Body weight
 
@@ -198,9 +209,10 @@ Tools are grouped by domain. Each lives in its own module under [`src/wger_mcp/t
 
 | Tool | Description |
 |------|-------------|
-| `search_exercises(query, language, limit)` | Find exercises by name (ISO 639-1 language code) |
+| `search_exercises(query, language?, limit?)` | Find exercises by name (ISO 639-1 language code). Returns id, name, category and equipment |
+| `search_exercises_batch(queries, language?, limit_per_query?)` | Resolve many names at once, one call instead of one per exercise |
 | `search_exercises_by_filter(equipment_id?, muscle_id?, category_id?, language?, limit?)` | Structured lookup (e.g. Dumbbell + Back) |
-| `get_exercise(id)` | Full exercise detail: muscles, equipment, instructions, images (with 2.6 `small`/`medium` thumbnails) |
+| `get_exercise(exercise_id)` | Full exercise detail: muscles, equipment, instructions, images (with 2.6 `small`/`medium` thumbnails) |
 | `list_categories` / `list_equipment` / `list_muscles` | Reference data |
 
 ### Ingredients

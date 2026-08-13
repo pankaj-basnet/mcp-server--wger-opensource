@@ -115,6 +115,7 @@ from .common import (
     api_tool,
     as_decimal,
     as_int,
+    as_weight_unit,
     bad_request,
     opt,
     require_fields,
@@ -638,11 +639,18 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         operation: str = "r",
         step: str = "abs",
         repeat: bool = False,
+        weight_unit: str | None = None,
     ) -> dict[str, Any]:
         """Create a per-iteration config record for a slot entry.
         kind: one of sets, reps, weight, rir, rest, max_sets, max_reps,
         max_weight, max_rir, max_rest. operation 'r' = replace, '+' = add,
-        '-' = subtract. step 'abs', 'percent' or 'na'."""
+        '-' = subtract. step 'abs', 'percent' or 'na'.
+
+        For kind='weight', pass weight_unit ('kg' or 'lb') to record what the
+        number means. wger stores the unit on the slot ENTRY rather than on the
+        weight config, so this patches the entry for you. Otherwise a weight set
+        here is silently read in whatever unit the entry already had.
+        """
         cfg = CONFIG_KINDS.get(kind)
         if cfg is None:
             return _unknown_kind(kind)
@@ -650,8 +658,24 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
             return bad_request(f"operation must be one of {OPERATIONS}")
         if step not in STEP_ENUM_VALUES:
             return bad_request(f"step must be one of {STEPS}")
+        entry = as_int(slot_entry_id, "slot_entry_id")
+        if weight_unit is not None:
+            if kind not in ("weight", "max_weight"):
+                return bad_request(
+                    f"weight_unit applies to kind 'weight' or 'max_weight', not '{kind}'"
+                )
+            try:
+                await slot_entry_partial_update.asyncio(
+                    id=entry,
+                    client=api,
+                    body=api_models.PatchedSlotEntryRequest(
+                        weight_unit=as_weight_unit(weight_unit)
+                    ),
+                )
+            except (UnexpectedStatus, httpx.HTTPError) as exc:
+                return api_err(exc) | {"stage": "slot-entry weight_unit"}
         body = cfg.request(
-            slot_entry=as_int(slot_entry_id, "slot_entry_id"),
+            slot_entry=entry,
             iteration=iteration,
             value=_config_value(cfg, kind, value),
             operation=operation,
@@ -668,19 +692,33 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         exercise_id: str,
         sets: Annotated[int, Field(ge=1, le=50)],
         reps: Annotated[int, Field(ge=1, le=1000)],
-        weight_kg: Annotated[float, Field(ge=0, le=1000)],
+        weight: Annotated[float | None, Field(ge=0, le=2000)] = None,
         slot_order: Annotated[int, Field(ge=1, le=100)] = 1,
+        weight_unit: str = "kg",
+        rir: Annotated[float | None, Field(ge=0, le=10)] = None,
     ) -> dict[str, Any]:
-        """High-level convenience: create slot + slot-entry + sets/reps/weight
-        configs in one call. Returns the created ids. Partial failures are
-        reported in the response."""
+        """High-level convenience: create slot + slot-entry + sets/reps configs
+        in one call. Returns the created ids. Partial failures are reported in
+        the response.
+
+        weight is optional: omit it to prescribe an exercise without a load,
+        which is the honest thing to do before the trainee's working weights are
+        known. weight_unit is 'kg' or 'lb' and is recorded on the entry, so the
+        number is stored in the unit it was given in rather than converted.
+
+        rir sets a Reps-In-Reserve target for the set, wger's autoregulation
+        field: 2 means "stop with two good reps left".
+        """
         # Parsed up front: the slot must not be created if a later id is bad
         day = as_int(day_id, "day_id")
         exercise = as_int(exercise_id, "exercise_id")
-        values = [
-            (kind, _config_value(CONFIG_KINDS[kind], kind, value))
-            for kind, value in (("sets", sets), ("reps", reps), ("weight", weight_kg))
-        ]
+        unit = as_weight_unit(weight_unit)
+        planned: list[tuple[str, float]] = [("sets", sets), ("reps", reps)]
+        if weight is not None:
+            planned.append(("weight", weight))
+        if rir is not None:
+            planned.append(("rir", rir))
+        values = [(kind, _config_value(CONFIG_KINDS[kind], kind, value)) for kind, value in planned]
 
         result: dict[str, Any] = {}
         try:
@@ -695,14 +733,14 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
             entry = await slot_entry_create.asyncio(
                 client=api,
                 body=api_models.SlotEntryRequest(
-                    slot=slot.id, exercise=exercise, order=1, comment=""
+                    slot=slot.id, exercise=exercise, order=1, comment="", weight_unit=unit
                 ),
             )
         except (UnexpectedStatus, httpx.HTTPError) as exc:
             return result | api_err(exc) | {"stage": "slot-entry"}
         result["slot_entry"] = entry.to_dict()
 
-        # The three configs only depend on the entry, so they go out together
+        # The configs only depend on the entry, so they go out together
         async def _config(kind: str, value: int | str) -> Any:
             cfg = CONFIG_KINDS[kind]
             return await cfg.create_mod.asyncio(

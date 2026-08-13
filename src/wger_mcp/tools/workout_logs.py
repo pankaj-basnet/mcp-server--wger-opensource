@@ -29,6 +29,7 @@ from .common import (
     as_decimal,
     as_int,
     as_uuid,
+    as_weight_unit,
     at_noon,
     opt,
     require_fields,
@@ -41,16 +42,26 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     async def log_set(
         exercise_id: str,
         reps: Annotated[int, Field(ge=1, le=1000)],
-        weight_kg: Annotated[float, Field(ge=0, le=1000)],
+        weight: Annotated[float, Field(ge=0, le=2000)],
         workout_log_date: date | datetime | None = None,
         rir: Annotated[float | None, Field(ge=0, le=10)] = None,
+        weight_unit: str = "kg",
     ) -> dict[str, Any]:
         """Log a completed set (workoutlog). Without a date, wger stamps the
-        entry with the current time; a bare date lands at 12:00."""
+        entry with the current time; a bare date lands at 12:00.
+
+        weight_unit is 'kg' or 'lb'. The weight is stored in the unit given, so
+        a trainee who works in pounds gets pounds back out, with no rounding
+        drift from converting twice.
+
+        rir records Reps In Reserve for the set: how many good repetitions were
+        left. It is how wger tracks set effort.
+        """
         body = api_models.WorkoutLogRequest(
             exercise=as_int(exercise_id, "exercise_id"),
             repetitions=str(reps),
-            weight=as_decimal(weight_kg),
+            weight=as_decimal(weight),
+            weight_unit=as_weight_unit(weight_unit),
             date=opt(at_noon(workout_log_date)),
             rir=opt(as_decimal(rir) if rir is not None else None),
         )
@@ -87,15 +98,21 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     async def update_workout_log(
         log_id: str,
         reps: Annotated[int | None, Field(ge=1, le=1000)] = None,
-        weight_kg: Annotated[float | None, Field(ge=0, le=1000)] = None,
+        weight: Annotated[float | None, Field(ge=0, le=2000)] = None,
         rir: Annotated[float | None, Field(ge=0, le=10)] = None,
         when: date | datetime | None = None,
+        weight_unit: str | None = None,
     ) -> dict[str, Any]:
-        """Patch a workout log entry. Only provided fields are sent."""
+        """Patch a workout log entry. Only provided fields are sent.
+
+        weight_unit ('kg' or 'lb') is only sent when given, so correcting reps
+        alone leaves the recorded unit untouched.
+        """
         log = as_uuid(log_id, "log_id")
         body = api_models.PatchedWorkoutLogRequest(
             repetitions=opt(str(reps) if reps is not None else None),
-            weight=opt(as_decimal(weight_kg) if weight_kg is not None else None),
+            weight=opt(as_decimal(weight) if weight is not None else None),
+            weight_unit=opt(as_weight_unit(weight_unit)),
             rir=opt(as_decimal(rir) if rir is not None else None),
             date=opt(at_noon(when)),
         )

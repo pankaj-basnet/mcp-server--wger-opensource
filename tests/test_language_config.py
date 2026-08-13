@@ -220,8 +220,12 @@ async def test_exercise_search_language_resolution(
     mcp = _register_exercises(_settings(default_language=configured))
     listing = _CaptureList()
     monkeypatch.setattr(exercises.exerciseinfo_list, "asyncio", listing)
+    # Search resolves the code to wger's numeric id to pick the right translation
+    languages = _CaptureList()
+    monkeypatch.setattr(exercises.language_list, "asyncio", languages)
     args: dict[str, Any] = {"query": "squat"}
     if passed is not None:
         args["language"] = passed
     await mcp.call_tool("search_exercises", args)
     assert listing.calls[-1]["language_code"] == expected
+    assert languages.calls[-1]["short_name"] == expected

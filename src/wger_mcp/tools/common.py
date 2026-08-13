@@ -19,6 +19,11 @@ T = TypeVar("T")
 # noon keeps it on the intended day in either direction of a timezone shift.
 _BARE_DATE_TIME = time(12, 0)
 
+# wger's weight-unit ids (/api/v2/setting-weightunit/). Used by logging and by
+# routine authoring, which record the unit in different places: a workout log
+# carries its own weight_unit, while a planned set takes it from its slot entry.
+WEIGHT_UNITS: dict[str, int] = {"kg": 1, "lb": 2}
+
 
 class ToolInputError(Exception):
     """An argument wger cannot accept. Reported to the caller as a 400."""
@@ -64,6 +69,18 @@ def as_int(value: str, field: str) -> int:
 def as_decimal(value: float) -> str:
     """Decimal fields travel as strings in the API."""
     return f"{value:g}"
+
+
+def as_weight_unit(unit: str | None) -> int | None:
+    """Look up wger's id for 'kg' or 'lb'. ``None`` stays ``None``."""
+    if unit is None:
+        return None
+    try:
+        return WEIGHT_UNITS[unit]
+    except KeyError:
+        raise ToolInputError(
+            f"unknown weight_unit '{unit}'; expected one of {', '.join(WEIGHT_UNITS)}"
+        ) from None
 
 
 def at_noon(when: date | datetime | None) -> datetime | None:
