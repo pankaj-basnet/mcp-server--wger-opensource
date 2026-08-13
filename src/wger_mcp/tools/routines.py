@@ -56,6 +56,69 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
             return err(exc)
 
     @mcp.tool()
+    async def get_workout_for_date(
+        routine_id: str,
+        workout_date: date | None = None,
+    ) -> dict[str, Any]:
+        """What the routine prescribes on a given date. Defaults to today.
+
+        Returns the day's label, its iteration, and one entry per planned
+        exercise carrying slot_entry_id plus the planned sets, repetitions,
+        weight and RiR. Feed routine_id, slot_entry_id and iteration straight
+        into log_set so the logged set attaches to the plan.
+
+        A rest day returns planned: [] with is_rest_day true.
+        """
+        target = workout_date or date.today()
+        try:
+            sequence = await client.get(f"routine/{routine_id}/date-sequence-gym/")
+        except WgerError as exc:
+            return err(exc)
+
+        for entry in sequence or []:
+            if entry.get("date") != target.isoformat():
+                continue
+            day = entry.get("day") or {}
+            planned = [
+                {
+                    "slot_entry_id": cfg.get("slot_entry_id"),
+                    "exercise_id": cfg.get("exercise"),
+                    "sets": cfg.get("sets"),
+                    "repetitions": cfg.get("repetitions"),
+                    "weight": cfg.get("weight"),
+                    "weight_unit": cfg.get("weight_unit"),
+                    "rir": cfg.get("rir"),
+                    "rest": cfg.get("rest"),
+                    "text_repr": cfg.get("text_repr"),
+                }
+                for slot in entry.get("slots") or []
+                for cfg in slot.get("sets") or []
+            ]
+            return {
+                "routine_id": routine_id,
+                "date": entry.get("date"),
+                "iteration": entry.get("iteration"),
+                "label": entry.get("label"),
+                "day_id": day.get("id"),
+                "day_name": day.get("name"),
+                "is_rest_day": bool(day.get("is_rest")) or not planned,
+                "planned": planned,
+            }
+
+        # Outside the routine's date range, or the routine has no day on it.
+        return {
+            "routine_id": routine_id,
+            "date": target.isoformat(),
+            "iteration": None,
+            "label": None,
+            "day_id": None,
+            "day_name": None,
+            "is_rest_day": True,
+            "planned": [],
+            "note": "no scheduled day on this date - it may fall outside the routine's range",
+        }
+
+    @mcp.tool()
     async def list_routine_days(
         routine_id: str,
         limit: Annotated[int, Field(ge=1, le=200)] = 50,

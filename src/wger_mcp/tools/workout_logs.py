@@ -31,9 +31,22 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         weight_kg: Annotated[float, Field(ge=0, le=1000)],
         workout_log_date: date | None = None,
         rir: Annotated[float | None, Field(ge=0, le=10)] = None,
+        routine_id: str | None = None,
+        slot_entry_id: str | None = None,
+        iteration: Annotated[int | None, Field(ge=1)] = None,
     ) -> dict[str, Any]:
-        """Log a completed set (workoutlog). Uses today if no date given."""
-        payload = {
+        """Log a completed set (workoutlog). Uses today if no date given.
+
+        Pass routine_id, slot_entry_id and iteration to attach the set to a
+        planned routine entry. Get all three from get_workout_for_date. Without
+        them the set is still logged, but as freestanding work that no routine
+        report can attribute.
+        """
+        if slot_entry_id is not None and routine_id is None:
+            return bad_request(
+                "slot_entry_id needs routine_id; both come from get_workout_for_date"
+            )
+        payload: dict[str, Any] = {
             "exercise": exercise_id,
             "repetitions": reps,
             "weight": weight_kg,
@@ -41,6 +54,12 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         }
         if rir is not None:
             payload["rir"] = rir
+        if routine_id is not None:
+            payload["routine"] = routine_id
+        if slot_entry_id is not None:
+            payload["slot_entry"] = slot_entry_id
+        if iteration is not None:
+            payload["iteration"] = iteration
         try:
             return await client.post("workoutlog/", json=payload)
         except WgerError as exc:
