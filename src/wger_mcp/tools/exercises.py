@@ -1,22 +1,33 @@
-"""Exercise / ingredient catalog tools (read-only lookups)."""
+"""Exercise / ingredient catalog tools (read-only lookups), via the generated
+``wger_api_client``."""
 
 from __future__ import annotations
 
 import asyncio
 from typing import Annotated, Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
+from wger_api_client.api.exercisecategory import exercisecategory_list
+from wger_api_client.api.exerciseinfo import exerciseinfo_list, exerciseinfo_retrieve
+from wger_api_client.api.ingredient import ingredient_list, ingredient_retrieve
+from wger_api_client.api.ingredientinfo import ingredientinfo_list
+from wger_api_client.api.language import language_list
+from wger_api_client.api.muscle import muscle_list
+from wger_api_client.client import AuthenticatedClient
+from wger_api_client.errors import UnexpectedStatus
 
+from ..api_client import paginate
 from ..config import Settings
-from ..wger_client import WgerClient, WgerError
-from .common import bad_request, err
+from .common import api_err, api_list_tool, api_tool, as_int, bad_request, opt
 
+# wger stores the grades lowercase, and so does the client's enum
 _NUTRISCORE = r"^[A-Ea-e]$"
 
 
 # wger's search is one request per name. Filling a training day means a dozen
-# of them, so the batch tool runs them concurrently — same cap as the Open Food
+# of them, so the batch tool runs them concurrently, same cap as the Open Food
 # Facts batch lookup.
 _BATCH_CONCURRENCY = 4
 
@@ -39,7 +50,61 @@ def _relevance(name: str, query: str) -> tuple[int, int]:
     return (-hits, len(lowered))
 
 
-def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
+def _shape_ingredient(ing: dict[str, Any], *, with_code: bool = False) -> dict[str, Any]:
+    out = {
+        "id": ing.get("id"),
+        "uuid": ing.get("uuid"),
+        "name": ing.get("name"),
+        "energy": ing.get("energy"),
+        "protein": ing.get("protein"),
+        "carbohydrates": ing.get("carbohydrates"),
+        "fat": ing.get("fat"),
+        "brand": ing.get("brand"),
+    }
+    if with_code:
+        out["code"] = ing.get("code")
+    return out
+
+
+def _pick_name(ex: dict[str, Any], language_id: int | None, query: str | None) -> str | None:
+    """The exercise's name in the requested language, preferring the query match.
+
+    exerciseinfo filters WHICH exercises match a language, but each result still
+    carries every translation, so without this a search answers in whatever
+    language happens to come first.
+    """
+    translations = [
+        t for t in (ex.get("translations") or []) if isinstance(t, dict) and t.get("name")
+    ]
+    pool = [t for t in translations if t.get("language") == language_id] or translations
+    if query:
+        q_lower = query.lower()
+        match = next((t for t in pool if q_lower in (t.get("name") or "").lower()), None)
+        if match:
+            return match.get("name")
+    return pool[0].get("name") if pool else None
+
+
+def _shape_exercise(
+    ex: dict[str, Any],
+    language_id: int | None,
+    query: str | None = None,
+    *,
+    with_muscles: bool = False,
+) -> dict[str, Any]:
+    """Enough to pick an exercise; get_exercise returns the full record."""
+    shaped: dict[str, Any] = {
+        "id": ex.get("id"),
+        "name": _pick_name(ex, language_id, query),
+        "category": (ex.get("category") or {}).get("name"),
+        "equipment": [e.get("name") for e in (ex.get("equipment") or [])],
+    }
+    if with_muscles:
+        shaped["muscles"] = [m.get("name") for m in (ex.get("muscles") or [])]
+    return shaped
+
+
+def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None:
     default_language = settings.default_language
     # exerciseinfo filters WHICH exercises match a language, but each one still
     # carries every translation. Picking the wrong one hands the caller a name in
@@ -50,14 +115,14 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
     async def _language_id_for(code: str) -> int | None:
         if code not in _language_id:
             try:
-                rows = await client.paginate(
-                    "language/", params={"short_name": code}, limit=5
-                )
-                _language_id[code] = next(
-                    (r.get("id") for r in rows if isinstance(r, dict) and r.get("id")), None
-                )
-            except WgerError:
-                _language_id[code] = None
+                rows = await paginate(language_list.asyncio, client=api, limit=5, short_name=code)
+            except (UnexpectedStatus, httpx.HTTPError):
+                # A lookup failure must not fail the search: without an id the
+                # shaping falls back to the first translation, as it did before.
+                return None
+            _language_id[code] = next(
+                (r.get("id") for r in rows if isinstance(r, dict) and r.get("id")), None
+            )
         return _language_id[code]
 
     async def _search(query: str, lang: str, limit: int) -> list[dict[str, Any]]:
@@ -66,35 +131,19 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         # Fetch wider than asked for, rank locally, then trim: the extra rows cost
         # a little bandwidth and no context, and wger's own ordering buries the
         # exact match behind looser ones.
-        results = await client.paginate(
-            "exerciseinfo/",
-            params={"name__search": query, "language__code": lang},
+        results = await paginate(
+            exerciseinfo_list.asyncio,
+            client=api,
             limit=max(limit, _RANK_POOL),
+            name_search=query,
+            language_code=lang,
         )
-        q_lower = query.lower()
-        shaped: list[dict[str, Any]] = []
-        for ex in results:
-            if not isinstance(ex, dict):
-                continue
-            translations = [
-                t for t in (ex.get("translations") or []) if isinstance(t, dict) and t.get("name")
-            ]
-            in_language = [t for t in translations if t.get("language") == language_id]
-            pool = in_language or translations
-            match = next(
-                (t for t in pool if q_lower in (t.get("name") or "").lower()),
-                pool[0] if pool else None,
-            )
-            shaped.append({
-                "id": ex.get("id"),
-                "name": (match or {}).get("name"),
-                "category": (ex.get("category") or {}).get("name"),
-                "equipment": [e.get("name") for e in (ex.get("equipment") or [])],
-            })
+        shaped = [_shape_exercise(ex, language_id, query) for ex in results]
         shaped.sort(key=lambda s: _relevance(s.get("name") or "", query))
         return shaped[:limit]
 
     @mcp.tool()
+    @api_list_tool
     async def search_exercises(
         query: Annotated[str, Field(min_length=2)],
         language: Annotated[str | None, Field(pattern=r"^[a-z]{2}$")] = None,
@@ -108,12 +157,10 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         ``language`` is an ISO 639-1 code ('en', 'pl', 'de', ...); it defaults to
         the server's ``DEFAULT_LANGUAGE``.
         """
-        try:
-            return await _search(query, language or default_language, limit)
-        except WgerError as exc:
-            return [err(exc)]
+        return await _search(query, language or default_language, limit)
 
     @mcp.tool()
+    @api_tool
     async def search_exercises_batch(
         queries: list[str],
         language: Annotated[str | None, Field(pattern=r"^[a-z]{2}$")] = None,
@@ -135,28 +182,31 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         unique = list(dict.fromkeys(q for q in queries if q and len(q) >= 2))
         sem = asyncio.Semaphore(_BATCH_CONCURRENCY)
 
+        # One failing name is reported in its own entry, so the others still land
         async def _one(q: str) -> tuple[str, Any]:
             async with sem:
                 try:
                     return q, await _search(q, lang, limit_per_query)
-                except WgerError as exc:
-                    return q, [err(exc)]
+                except (UnexpectedStatus, httpx.HTTPError) as exc:
+                    return q, [api_err(exc)]
 
         results = dict(await asyncio.gather(*[_one(q) for q in unique]))
         return {"count": len(results), "results": results}
 
     @mcp.tool()
+    @api_tool
     async def get_exercise(exercise_id: str) -> dict[str, Any]:
         """Fetch full exercise detail (instructions, muscles, equipment, images).
 
         Since wger 2.6 each image also carries ``thumbnails`` with ``small`` and
         ``medium`` URLs (returned verbatim in the raw detail)."""
-        try:
-            return await client.get(f"exerciseinfo/{exercise_id}/")
-        except WgerError as exc:
-            return err(exc)
+        exercise = await exerciseinfo_retrieve.asyncio(
+            id=as_int(exercise_id, "exercise_id"), client=api
+        )
+        return exercise.to_dict()
 
     @mcp.tool()
+    @api_list_tool
     async def search_ingredients(
         query: Annotated[str, Field(min_length=2)],
         language: Annotated[str | None, Field(pattern=r"^[a-z]{2}$")] = None,
@@ -178,45 +228,29 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         chosen = [v for v in (nutriscore, nutriscore_better_than, nutriscore_at_worst) if v]
         if len(chosen) > 1:
             return [bad_request("pass at most one nutriscore filter")]
-        params: dict[str, Any] = {
-            "name__search": query,
-            "language__code": language or default_language,
-        }
-        if nutriscore:
-            params["nutriscore"] = nutriscore.upper()
-        elif nutriscore_better_than:
-            params["nutriscore__lt"] = nutriscore_better_than.upper()
-        elif nutriscore_at_worst:
-            params["nutriscore__lte"] = nutriscore_at_worst.upper()
-        try:
-            results = await client.paginate("ingredientinfo/", params=params, limit=limit)
-        except WgerError as exc:
-            return [err(exc)]
-        shaped: list[dict[str, Any]] = []
-        for ing in results:
-            if not isinstance(ing, dict):
-                continue
-            shaped.append({
-                "id": ing.get("id"),
-                "uuid": ing.get("uuid"),
-                "name": ing.get("name"),
-                "energy": ing.get("energy"),
-                "protein": ing.get("protein"),
-                "carbohydrates": ing.get("carbohydrates"),
-                "fat": ing.get("fat"),
-                "brand": ing.get("brand"),
-            })
-        return shaped
+        results = await paginate(
+            ingredientinfo_list.asyncio,
+            client=api,
+            limit=limit,
+            name_search=query,
+            language_code=language or default_language,
+            nutriscore=opt(nutriscore.lower() if nutriscore else None),
+            nutriscore_lt=opt(nutriscore_better_than.lower() if nutriscore_better_than else None),
+            nutriscore_lte=opt(nutriscore_at_worst.lower() if nutriscore_at_worst else None),
+        )
+        return [_shape_ingredient(ing) for ing in results]
 
     @mcp.tool()
+    @api_tool
     async def get_ingredient(ingredient_id: str) -> dict[str, Any]:
         """Fetch full ingredient detail (macros per 100 g, brand, etc.)."""
-        try:
-            return await client.get(f"ingredient/{ingredient_id}/")
-        except WgerError as exc:
-            return err(exc)
+        ingredient = await ingredient_retrieve.asyncio(
+            id=as_int(ingredient_id, "ingredient_id"), client=api
+        )
+        return ingredient.to_dict()
 
     @mcp.tool()
+    @api_list_tool
     async def search_ingredient_by_barcode(
         barcode: Annotated[str, Field(min_length=4, max_length=32)],
         limit: Annotated[int, Field(ge=1, le=20)] = 5,
@@ -224,50 +258,27 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         """Look up ingredients by EAN/UPC barcode (exact match on the wger
         `code` field). Typically returns 0 or 1 result — much more precise
         than name search."""
-        try:
-            results = await client.paginate(
-                "ingredient/", params={"code": barcode}, limit=limit
-            )
-        except WgerError as exc:
-            return [err(exc)]
-        shaped: list[dict[str, Any]] = []
-        for ing in results:
-            if not isinstance(ing, dict):
-                continue
-            shaped.append({
-                "id": ing.get("id"),
-                "uuid": ing.get("uuid"),
-                "name": ing.get("name"),
-                "code": ing.get("code"),
-                "brand": ing.get("brand"),
-                "energy": ing.get("energy"),
-                "protein": ing.get("protein"),
-                "carbohydrates": ing.get("carbohydrates"),
-                "fat": ing.get("fat"),
-            })
-        return shaped
+        results = await paginate(ingredient_list.asyncio, client=api, limit=limit, code=barcode)
+        return [_shape_ingredient(ing, with_code=True) for ing in results]
 
     @mcp.tool()
+    @api_list_tool
     async def list_categories(
         limit: Annotated[int, Field(ge=1, le=500)] = 100,
     ) -> list[dict[str, Any]]:
         """List exercise categories (Chest, Back, …)."""
-        try:
-            return await client.paginate("exercisecategory/", limit=limit)
-        except WgerError as exc:
-            return [err(exc)]
+        return await paginate(exercisecategory_list.asyncio, client=api, limit=limit)
 
     @mcp.tool()
+    @api_list_tool
     async def list_muscles(
         limit: Annotated[int, Field(ge=1, le=500)] = 100,
     ) -> list[dict[str, Any]]:
         """List muscles."""
-        try:
-            return await client.paginate("muscle/", limit=limit)
-        except WgerError as exc:
-            return [err(exc)]
+        return await paginate(muscle_list.asyncio, client=api, limit=limit)
 
     @mcp.tool()
+    @api_list_tool
     async def search_exercises_by_filter(
         equipment_id: str | None = None,
         muscle_id: str | None = None,
@@ -280,34 +291,20 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         ``language`` is an ISO 639-1 code; it defaults to the server's
         ``DEFAULT_LANGUAGE``.
         """
-        params: dict[str, Any] = {"language__code": language or default_language}
+        filters: dict[str, Any] = {}
         if equipment_id is not None:
-            params["equipment"] = equipment_id
+            filters["equipment"] = as_int(equipment_id, "equipment_id")
         if muscle_id is not None:
-            params["muscles"] = muscle_id
+            filters["muscles"] = as_int(muscle_id, "muscle_id")
         if category_id is not None:
-            params["category"] = category_id
-        try:
-            results = await client.paginate("exerciseinfo/", params=params, limit=limit)
-        except WgerError as exc:
-            return [err(exc)]
-        language_id = await _language_id_for(params["language__code"])
-        shaped: list[dict[str, Any]] = []
-        for ex in results:
-            if not isinstance(ex, dict):
-                continue
-            translations = [
-                t for t in (ex.get("translations") or []) if isinstance(t, dict) and t.get("name")
-            ]
-            # Same rule as search_exercises: never hand back a name in a language
-            # the caller did not ask for when one in that language exists.
-            in_language = [t for t in translations if t.get("language") == language_id]
-            pool = in_language or translations
-            shaped.append({
-                "id": ex.get("id"),
-                "name": (pool[0].get("name") if pool else None),
-                "category": (ex.get("category") or {}).get("name"),
-                "equipment": [e.get("name") for e in (ex.get("equipment") or [])],
-                "muscles": [m.get("name") for m in (ex.get("muscles") or [])],
-            })
-        return shaped
+            filters["category"] = as_int(category_id, "category_id")
+        lang = language or default_language
+        results = await paginate(
+            exerciseinfo_list.asyncio,
+            client=api,
+            limit=limit,
+            language_code=lang,
+            **filters,
+        )
+        language_id = await _language_id_for(lang)
+        return [_shape_exercise(ex, language_id, with_muscles=True) for ex in results]

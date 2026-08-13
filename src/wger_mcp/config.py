@@ -195,10 +195,6 @@ class Settings(BaseSettings):
 
     # ---------- derived ----------
     @property
-    def wger_api_root(self) -> str:
-        return str(self.wger_base_url).rstrip("/") + "/api/v2"
-
-    @property
     def provider_token_url(self) -> str:
         return str(self.wger_base_url).rstrip("/") + self.wger_allauth_provider_token_path
 

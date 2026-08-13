@@ -152,7 +152,7 @@ Tools are grouped by domain. Each lives in its own module under [`src/wger_mcp/t
 
 ### Registering only some groups
 
-All 81 tools are registered by default. `MCP_TOOLS` narrows that to a comma-separated list of groups:
+All 78 tools are registered by default. `MCP_TOOLS` narrows that to a comma-separated list of groups:
 
 ```bash
 MCP_TOOLS=nutrition,off,profile     # a food-logging agent
@@ -179,24 +179,23 @@ This matters most for agents driven by small local models, whose tool-selection 
 | `list_routine_days(routine_id)` / `get_routine_day(day_id)` | Read day structure |
 | `add_routine_day(routine_id, name, order, description?, is_rest?, day_type?)` | Add a training day |
 | `update_routine_day(day_id, ...)` / `delete_routine_day(day_id)` | Patch / delete a day (cascade) |
-| `list_slots(day_id)` / `add_slot_to_day(day_id, order, sets?, rest_seconds?)` | List / add exercise slots |
+| `list_slots(day_id)` / `add_slot_to_day(day_id, order, comment?)` | List / add exercise slots |
 | `update_slot(slot_id, ...)` / `delete_slot(slot_id)` | Patch / delete a slot (cascade) |
 | `list_slot_entries(slot_id)` / `get_slot_entry(entry_id)` | Read exercise entries in a slot |
 | `attach_exercise_to_slot(slot_id, exercise_id, order?, repetition_unit?, weight_unit?, comment?)` | Bind an exercise to a slot |
-| `update_slot_entry(entry_id, ...)` / `delete_slot_entry(entry_id)` | Patch / delete a slot entry |
+| `update_slot_entry(slot_entry_id, ...)` / `delete_slot_entry(slot_entry_id)` | Patch / delete a slot entry |
 | `list_slot_entry_configs(slot_entry_id, kinds?)` | Read per-iteration configs (sets/reps/weight/rir/rest/max_*) |
-| `set_slot_entry_config(slot_entry_id, kind, value, iteration?, operation?, step?, repeat?)` | Add a per-iteration config record |
+| `set_slot_entry_config(slot_entry_id, kind, value, iteration?, operation?, step?, repeat?, weight_unit?)` | Add a per-iteration config record. `weight_unit` applies to `kind='weight'`/`'max_weight'` and is recorded on the slot entry |
 | `update_slot_entry_config(kind, config_id, value?, iteration?, ...)` / `delete_slot_entry_config(kind, config_id)` | Patch / delete a config record (use to bump weight on progression) |
-| `add_exercise_with_sets(day_id, exercise_id, sets, reps, weight_kg, slot_order?, rest_seconds?)` | Convenience: slot + entry + sets/reps/weight configs in one call |
-| `list_workouts` | Legacy workout plans |
+| `add_exercise_with_sets(day_id, exercise_id, sets, reps, weight?, slot_order?, weight_unit?, rir?)` | Convenience: slot + entry + sets/reps configs in one call. Omit `weight` to prescribe sets without a load |
 
 ### Workout logs
 
 | Tool | Description |
 |------|-------------|
-| `log_set(exercise_id, reps, weight_kg, workout_log_date?, rir?)` | Add a workout log entry |
+| `log_set(exercise_id, reps, weight, workout_log_date?, rir?, weight_unit?)` | Add a workout log entry. `weight_unit` is `kg` (default) or `lb`; the weight is stored in the unit given, with no conversion |
 | `list_workout_logs(date_from?, date_to?, exercise_id?, limit?)` / `get_workout_log(log_id)` | Read entries |
-| `update_workout_log(log_id, ...)` / `delete_workout_log(log_id)` | Edit / remove an entry |
+| `update_workout_log(log_id, reps?, weight?, rir?, when?, weight_unit?)` / `delete_workout_log(log_id)` | Edit / remove an entry |
 
 ### Body weight
 
@@ -210,9 +209,10 @@ This matters most for agents driven by small local models, whose tool-selection 
 
 | Tool | Description |
 |------|-------------|
-| `search_exercises(query, language, limit)` | Find exercises by name (ISO 639-1 language code) |
+| `search_exercises(query, language?, limit?)` | Find exercises by name (ISO 639-1 language code). Returns id, name, category and equipment |
+| `search_exercises_batch(queries, language?, limit_per_query?)` | Resolve many names at once, one call instead of one per exercise |
 | `search_exercises_by_filter(equipment_id?, muscle_id?, category_id?, language?, limit?)` | Structured lookup (e.g. Dumbbell + Back) |
-| `get_exercise(id)` | Full exercise detail: muscles, equipment, instructions, images (with 2.6 `small`/`medium` thumbnails) |
+| `get_exercise(exercise_id)` | Full exercise detail: muscles, equipment, instructions, images (with 2.6 `small`/`medium` thumbnails) |
 | `list_categories` / `list_equipment` / `list_muscles` | Reference data |
 
 ### Ingredients
@@ -330,9 +330,9 @@ uv run ruff check .
 ### Source layout
 
 - [`src/wger_mcp/server.py`](src/wger_mcp/server.py) — Starlette + FastMCP wiring, lifespan, healthcheck, OAuth metadata, auth middleware.
-- [`src/wger_mcp/wger_client.py`](src/wger_mcp/wger_client.py) — async httpx wrapper. Resolves the per-request wger credential from the token provider. `paginate()` uses `count` + `next` URL to fan out remaining pages concurrently (page- or offset-style), with serial fallback for unknown formats.
+- [`src/wger_mcp/api_client.py`](src/wger_mcp/api_client.py) — bridge to the generated [`wger-api-client`](https://pypi.org/project/wger-api-client/): resolves the per-request wger credential from the token provider via a custom httpx auth, plus offset pagination over the generated `*_list` endpoints.
 - [`src/wger_mcp/auth/`](src/wger_mcp/auth/) — inbound OIDC validation (`oidc.py`, discovery in `oidc_discovery.py`), token exchange + outbound credential provider (`exchange.py`), per-request identity (`identity.py`), OAuth metadata (`oauth.py`).
-- [`src/wger_mcp/tools/`](src/wger_mcp/tools/) — one module per domain. Each exposes `register(mcp, client, settings)`; [`tools/__init__.py`](src/wger_mcp/tools/__init__.py) registers them all.
+- [`src/wger_mcp/tools/`](src/wger_mcp/tools/) — one module per domain. Each exposes `register(mcp, api, settings)`; [`tools/__init__.py`](src/wger_mcp/tools/__init__.py) registers them all.
 
 ### Performance notes
 

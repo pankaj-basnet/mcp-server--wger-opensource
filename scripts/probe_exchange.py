@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end probe for the Keycloak -> wger token-exchange chain.
 
-Exercises the *real* TokenExchanger + WgerClient against a live Keycloak and
+Exercises the *real* TokenExchanger + API client against a live Keycloak and
 wger 2.6, printing each hop so the infra assumptions (RFC 8693 enabled,
 provider/token contract, allauth provider id) can be confirmed without the MCP
 transport layer.
@@ -30,13 +30,17 @@ import sys
 # Make `src/` importable when run from a checkout without an install.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from wger_api_client.api.userprofile import userprofile_list
+from wger_api_client.errors import UnexpectedStatus
+
+from wger_mcp.api_client import build_api_client
 from wger_mcp.auth.exchange import (
     TokenExchanger,
     WgerTokenError,
     WgerTokenProvider,
 )
 from wger_mcp.auth.identity import Identity, reset_identity, set_identity
-from wger_mcp.wger_client import WgerClient, WgerError
+from wger_mcp.config import Settings
 
 
 def _env(name: str, default: str | None = None) -> str:
@@ -83,7 +87,11 @@ async def main() -> int:
         provider=args.provider,
     )
     identity = Identity(subject="probe", inbound_token=args.subject_token)
-    client = WgerClient(f"{wger_base}/api/v2", WgerTokenProvider(exchanger=ex))
+    provider = WgerTokenProvider(exchanger=ex)
+    settings = Settings(  # auth strategy is irrelevant here, only the base URL is used
+        wger_base_url=wger_base, mcp_auth="none", wger_dev_token="unused"
+    )
+    api = build_api_client(settings, provider)
     ctx = set_identity(identity)
     try:
         # Hop 1+2: Keycloak token-exchange -> wger provider/token -> wger JWT.
@@ -96,17 +104,17 @@ async def main() -> int:
 
         # Hop 3: call the wger REST API as that user.
         try:
-            profile = await client.get("userprofile/")
-        except WgerError as exc:
-            print(f"[FAIL] GET /api/v2/userprofile/: {exc.status} {exc.body}")
+            profile = await userprofile_list.asyncio(client=api)
+        except UnexpectedStatus as exc:
+            print(f"[FAIL] GET /api/v2/userprofile/: {exc.status_code} {exc.content[:200]}")
             return 3
-        results = profile.get("results", profile) if isinstance(profile, dict) else profile
-        print(f"[OK] GET /api/v2/userprofile/ → {str(results)[:200]}")
+        print(f"[OK] GET /api/v2/userprofile/ → {str(profile.to_dict())[:200]}")
         print("\nALL GREEN — the exchange chain works end to end.")
         return 0
     finally:
         reset_identity(ctx)
-        await client.aclose()  # closes the provider + exchanger too
+        await api.get_async_httpx_client().aclose()
+        await provider.aclose()  # closes the exchanger too
 
 
 if __name__ == "__main__":

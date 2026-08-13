@@ -8,9 +8,9 @@ from typing import Any
 import pytest
 from mcp.server.fastmcp import FastMCP
 
+from wger_mcp.api_client import build_api_client
 from wger_mcp.config import Settings, load_settings
-from wger_mcp.tools import TOOL_GROUPS, register_all
-from wger_mcp.wger_client import WgerClient
+from wger_mcp.tools import TOOL_GROUPS, off, register_all
 
 
 def _settings(**overrides: Any) -> Settings:
@@ -31,10 +31,20 @@ class _StubProvider:
         pass
 
 
+def _register(mcp: FastMCP, settings: Settings) -> None:
+    """off talks to Open Food Facts, so it gets its own client."""
+    register_all(
+        mcp,
+        build_api_client(settings, _StubProvider()),
+        off.build_http(),
+        settings,
+    )
+
+
 async def _tool_names(**overrides: Any) -> set[str]:
     settings = _settings(**overrides)
     mcp = FastMCP("test")
-    register_all(mcp, WgerClient(settings.wger_api_root, _StubProvider()), settings)  # type: ignore[arg-type]
+    _register(mcp, settings)
     return {tool.name for tool in await mcp.list_tools()}
 
 
@@ -101,4 +111,4 @@ def test_every_group_name_is_a_valid_selection() -> None:
     for group in TOOL_GROUPS:
         settings = _settings(mcp_tools=[group])
         mcp = FastMCP("test")
-        register_all(mcp, WgerClient(settings.wger_api_root, _StubProvider()), settings)  # type: ignore[arg-type]
+        _register(mcp, settings)

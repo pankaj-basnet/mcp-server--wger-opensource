@@ -1,19 +1,21 @@
 """MCP tool modules, grouped by domain.
 
-Each module exposes a ``register(mcp, client, settings)`` function that attaches
-its tools to the given FastMCP instance. ``server.build_app`` calls them all by
-default, or only the groups named in ``MCP_TOOLS``. Modules that need no
-configuration simply ignore ``settings``.
+Each wger-facing module exposes ``register(mcp, api, settings)`` on the typed
+``wger_api_client``; ``off`` talks to Open Food Facts through its own httpx
+client. ``server.build_app`` calls them all by default, or only the groups
+named in ``MCP_TOOLS``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
+from wger_api_client.client import AuthenticatedClient
 
 from ..config import Settings
-from ..wger_client import WgerClient
 from . import (
     analytics,
     body_weight,
@@ -27,7 +29,9 @@ from . import (
     workout_logs,
 )
 
-Registrar = Callable[[FastMCP, WgerClient, Settings], None]
+# The client argument is Any because off takes the Open Food Facts httpx
+# client where the others take the wger one.
+Registrar = Callable[[FastMCP, Any, Settings], None]
 
 # Keyed by group name, which is the module name. Iteration order is the
 # registration order, so it stays stable no matter how MCP_TOOLS is written.
@@ -48,7 +52,9 @@ _REGISTRARS: dict[str, Registrar] = {
 TOOL_GROUPS: tuple[str, ...] = tuple(_REGISTRARS)
 
 
-def register_all(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
+def register_all(
+    mcp: FastMCP, api: AuthenticatedClient, off_http: httpx.AsyncClient, settings: Settings
+) -> None:
     """Register tool modules on the given FastMCP instance.
 
     Registers every group unless ``settings.mcp_tools`` names a subset. An
@@ -64,7 +70,7 @@ def register_all(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         )
     for name in TOOL_GROUPS:
         if name in selected:
-            _REGISTRARS[name](mcp, client, settings)
+            _REGISTRARS[name](mcp, off_http if name == "off" else api, settings)
 
 
 __all__ = ["TOOL_GROUPS", "register_all"]
