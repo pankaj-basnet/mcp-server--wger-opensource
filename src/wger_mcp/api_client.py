@@ -2,25 +2,30 @@
 
 The generated client expects one fixed token; here the ``Authorization``
 header is resolved per request from the caller's identity instead (see
-``auth/exchange.py``), so one shared client serves all users. Plus the two
-helpers the tool modules need: offset pagination and error shaping.
+``auth/exchange.py``), so one shared client serves all users. Plus the
+offset pagination the tool modules need on top of the generated ``*_list``
+endpoints.
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from importlib.metadata import version
 from typing import Any, Protocol
 
 import httpx
 from wger_api_client.client import AuthenticatedClient
-from wger_api_client.errors import UnexpectedStatus
 
 from .auth.exchange import WgerTokenProvider
 from .config import Settings
 
-# One request per page; matches wger's maximum API page size.
-_PAGE_LIMIT = 100
+# wger caps a page at 999 (WgerLimitOffsetPagination.max_limit)
+_PAGE_LIMIT = 999
+
+_USER_AGENT = f"wger-mcp/{version('wger-mcp')}"
+# Never sent: _ProviderAuth sets the header on every request. Only the unused
+# synchronous client would fall back to it.
+_UNUSED_TOKEN = "unused-async-client-authenticates-per-request"
 
 
 class _ProviderAuth(httpx.Auth):
@@ -37,11 +42,16 @@ class _ProviderAuth(httpx.Auth):
 
 
 def build_api_client(settings: Settings, provider: WgerTokenProvider) -> AuthenticatedClient:
-    """One shared typed client; auth is per-request via ``_ProviderAuth``."""
+    """One shared typed client; auth is per-request via ``_ProviderAuth``.
+
+    Only the async half is wired up. The generated client's synchronous
+    functions would build their own httpx client from ``token`` and send that
+    placeholder as a credential, so this server never calls them.
+    """
     base_url = str(settings.wger_base_url).rstrip("/")
     api = AuthenticatedClient(
         base_url=base_url,
-        token="unused-per-request-auth",
+        token=_UNUSED_TOKEN,
         raise_on_unexpected_status=True,
     )
     api.set_async_httpx_client(
@@ -51,20 +61,11 @@ def build_api_client(settings: Settings, provider: WgerTokenProvider) -> Authent
             timeout=20.0,
             headers={
                 "Accept": "application/json",
-                "User-Agent": "wger-mcp/0.1",
+                "User-Agent": _USER_AGENT,
             },
         )
     )
     return api
-
-
-def api_err(exc: UnexpectedStatus) -> dict[str, Any]:
-    """Shape an UnexpectedStatus as the tool-response error dict."""
-    try:
-        detail: Any = json.loads(exc.content)
-    except ValueError:
-        detail = exc.content.decode(errors="replace")
-    return {"error": True, "status": exc.status_code, "detail": detail}
 
 
 class _Page(Protocol):
@@ -82,9 +83,10 @@ async def paginate(
     """Collect up to ``limit`` items from a generated ``*_list.asyncio``."""
     results: list[dict[str, Any]] = []
     while len(results) < limit:
+        asked_for = min(limit - len(results), _PAGE_LIMIT)
         page = await list_fn(
             client=client,
-            limit=min(limit - len(results), _PAGE_LIMIT),
+            limit=asked_for,
             offset=len(results) or None,
             **filters,
         )
@@ -92,6 +94,9 @@ async def paginate(
         if not items:
             break
         results.extend(item.to_dict() for item in items)
+        # A page shorter than asked for is the last one, with or without a count
+        if len(items) < asked_for:
+            break
         count = page.count if isinstance(page.count, int) else None
         if count is not None and len(results) >= count:
             break

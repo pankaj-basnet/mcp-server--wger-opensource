@@ -7,11 +7,10 @@ parsed into the client's id types internally.
 from __future__ import annotations
 
 import asyncio
-import json
-from datetime import date, datetime, time
+from datetime import date, datetime
 from typing import Annotated, Any
-from uuid import UUID
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 from wger_api_client import models as api_models
@@ -31,101 +30,54 @@ from wger_api_client.api.nutritionplan import (
     nutritionplan_partial_update,
     nutritionplan_retrieve,
 )
-from wger_api_client.api.userprofile import userprofile_create, userprofile_list
+from wger_api_client.api.userprofile import userprofile_partial_update, userprofile_retrieve
 from wger_api_client.api.weightentry import weightentry_list
 from wger_api_client.client import AuthenticatedClient
 from wger_api_client.errors import UnexpectedStatus
-from wger_api_client.types import UNSET, Unset
+from wger_api_client.types import UNSET
 
-from ..api_client import api_err, paginate
+from ..api_client import paginate
 from ..config import Settings
-from .common import bad_request
+from .common import (
+    api_err,
+    api_list_tool,
+    api_tool,
+    as_decimal,
+    as_int,
+    as_uuid,
+    at_noon,
+    bad_request,
+    opt,
+    require_fields,
+)
 
 _INGREDIENT_CONCURRENCY = 8
 
-# Time of day used when a caller supplies a bare date for a diary entry. wger
-# stores diary entries as a full timestamp, so a date alone has to land
-# somewhere; noon keeps the entry on the intended day in either direction under
-# a timezone shift, which midnight would not.
-_BARE_DATE_TIME = time(12, 0)
-
-
-def _diary_timestamp(when: date | datetime | None) -> str | None:
-    """Normalise a diary ``when`` argument to what wger's ``datetime`` expects.
-
-    ``None`` returns ``None`` so the caller can omit the field entirely and let
-    wger apply its own ``timezone.now`` default. A ``datetime`` is preserved
-    exactly, including any timezone offset. A bare ``date`` is anchored at
-    :data:`_BARE_DATE_TIME`.
-
-    Note ``datetime`` is a subclass of ``date``, so the subclass is checked
-    first.
-    """
-    if when is None:
-        return None
-    if isinstance(when, datetime):
-        return when.isoformat()
-    return datetime.combine(when, _BARE_DATE_TIME).isoformat()
-
-
-def _diary_datetime(when: date | datetime | None) -> datetime | Unset:
-    """The same normalisation, as the ``datetime`` the request models want."""
-    stamp = _diary_timestamp(when)
-    return datetime.fromisoformat(stamp) if stamp is not None else UNSET
-
-
-def _uuid(value: str, field: str) -> UUID:
-    """Parse an opaque string id into the UUID the API expects."""
-    try:
-        return UUID(value)
-    except ValueError:
-        raise ValueError(f"{field} must be a UUID, got {value!r}") from None
-
-
-def _amount(value: float) -> str:
-    """Decimal fields travel as strings in the API."""
-    return f"{value:g}"
-
-
-async def _post_userprofile(
-    api: AuthenticatedClient, body: api_models.UserprofileRequest
-) -> dict[str, Any]:
-    """Update the caller's profile via POST /userprofile/."""
-    try:
-        updated = await userprofile_create.asyncio(client=api, body=body)
-        return updated.to_dict()
-    except UnexpectedStatus as exc:
-        # wger answers 200, clients <= 2.6.0 only know the schema's 201
-        if exc.status_code == 200:
-            return json.loads(exc.content)
-        raise
+# Model field limits, so the caller is told before the server refuses
+PLAN_DESCRIPTION_MAX = 80
+MEAL_NAME_MAX = 25
 
 
 def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None:
     @mcp.tool()
+    @api_list_tool
     async def list_nutrition_plans(
         limit: Annotated[int, Field(ge=1, le=50)] = 10,
     ) -> list[dict[str, Any]]:
         """List your nutrition plans."""
-        try:
-            return await paginate(nutritionplan_list.asyncio, client=api, limit=limit)
-        except UnexpectedStatus as exc:
-            return [api_err(exc)]
+        return await paginate(nutritionplan_list.asyncio, client=api, limit=limit)
 
     @mcp.tool()
+    @api_tool
     async def get_nutrition_plan(plan_id: str) -> dict[str, Any]:
         """Fetch one nutrition plan with meals and items."""
-        try:
-            plan = await nutritionplan_retrieve.asyncio(id=_uuid(plan_id, "plan_id"), client=api)
-            return plan.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        plan = await nutritionplan_retrieve.asyncio(id=as_uuid(plan_id, "plan_id"), client=api)
+        return plan.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def create_nutrition_plan(
-        description: Annotated[str, Field(max_length=255)] = "",
+        description: Annotated[str, Field(max_length=PLAN_DESCRIPTION_MAX)] = "",
         only_logging: bool = False,
         goal_energy: Annotated[float | None, Field(ge=0, le=20000)] = None,
         goal_protein: Annotated[float | None, Field(ge=0, le=2000)] = None,
@@ -143,16 +95,14 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
             ),
             goal_fat=int(goal_fat) if goal_fat is not None else UNSET,
         )
-        try:
-            created = await nutritionplan_create.asyncio(client=api, body=body)
-            return created.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
+        created = await nutritionplan_create.asyncio(client=api, body=body)
+        return created.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def update_nutrition_plan(
         plan_id: str,
-        description: Annotated[str | None, Field(max_length=255)] = None,
+        description: Annotated[str | None, Field(max_length=PLAN_DESCRIPTION_MAX)] = None,
         only_logging: bool | None = None,
         goal_energy: Annotated[float | None, Field(ge=0, le=20000)] = None,
         goal_protein: Annotated[float | None, Field(ge=0, le=2000)] = None,
@@ -161,8 +111,8 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     ) -> dict[str, Any]:
         """Patch a nutrition plan. Only provided fields are sent."""
         body = api_models.PatchedNutritionPlanRequest(
-            description=description if description is not None else UNSET,
-            only_logging=only_logging if only_logging is not None else UNSET,
+            description=opt(description),
+            only_logging=opt(only_logging),
             goal_energy=int(goal_energy) if goal_energy is not None else UNSET,
             goal_protein=int(goal_protein) if goal_protein is not None else UNSET,
             goal_carbohydrates=(
@@ -170,50 +120,36 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
             ),
             goal_fat=int(goal_fat) if goal_fat is not None else UNSET,
         )
-        if not body.to_dict():
-            return bad_request("no fields to update")
-        try:
-            updated = await nutritionplan_partial_update.asyncio(
-                id=_uuid(plan_id, "plan_id"), client=api, body=body
-            )
-            return updated.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        require_fields(body)
+        updated = await nutritionplan_partial_update.asyncio(
+            id=as_uuid(plan_id, "plan_id"), client=api, body=body
+        )
+        return updated.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def delete_nutrition_plan(plan_id: str) -> dict[str, Any]:
         """Delete a nutrition plan (cascades to its meals and diary entries)."""
-        try:
-            await nutritionplan_destroy.asyncio_detailed(id=_uuid(plan_id, "plan_id"), client=api)
-            return {"deleted": True, "plan_id": plan_id}
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        await nutritionplan_destroy.asyncio_detailed(id=as_uuid(plan_id, "plan_id"), client=api)
+        return {"deleted": True, "plan_id": plan_id}
 
     @mcp.tool()
+    @api_tool
     async def create_meal(
         plan_id: str,
-        name: Annotated[str, Field(min_length=1, max_length=255)],
+        name: Annotated[str, Field(min_length=1, max_length=MEAL_NAME_MAX)],
         time: str | None = None,
     ) -> dict[str, Any]:
         """Create a meal in a nutrition plan (e.g. Breakfast, Lunch).
         time is 'HH:MM' or 'HH:MM:SS'; omit for an unscheduled meal.
         wger orders meals by time itself."""
         body = api_models.MealRequest(
-            plan=_uuid(plan_id, "plan_id"),
+            plan=as_uuid(plan_id, "plan_id"),
             name=name,
-            time=time if time is not None else UNSET,
+            time=opt(time),
         )
-        try:
-            meal = await meal_create.asyncio(client=api, body=body)
-            return meal.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        meal = await meal_create.asyncio(client=api, body=body)
+        return meal.to_dict()
 
     # Recipes — wger has no dedicated Recipe entity, so a "recipe" is modelled
     # as a Meal inside a NutritionPlan, with its MealItems acting as the
@@ -221,34 +157,27 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     # are semantic aliases over the meal + mealitem endpoints.
 
     @mcp.tool()
+    @api_tool
     async def create_recipe(
         plan_id: str,
-        name: Annotated[str, Field(min_length=1, max_length=255)],
+        name: Annotated[str, Field(min_length=1, max_length=MEAL_NAME_MAX)],
     ) -> dict[str, Any]:
         """Create a recipe (a named Meal inside a plan). Wger has no separate
         Recipe model, so this is a thin alias over POST /meal/ — the returned
         id is a meal_id, usable wherever meal_id is expected."""
-        body = api_models.MealRequest(plan=_uuid(plan_id, "plan_id"), name=name)
-        try:
-            meal = await meal_create.asyncio(client=api, body=body)
-            return meal.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        body = api_models.MealRequest(plan=as_uuid(plan_id, "plan_id"), name=name)
+        meal = await meal_create.asyncio(client=api, body=body)
+        return meal.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def get_recipe(recipe_id: str) -> dict[str, Any]:
         """Fetch a recipe (Meal) with its items. recipe_id = meal id."""
-        try:
-            meal = await meal_retrieve.asyncio(id=_uuid(recipe_id, "recipe_id"), client=api)
-            return meal.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        meal = await meal_retrieve.asyncio(id=as_uuid(recipe_id, "recipe_id"), client=api)
+        return meal.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def add_ingredient_to_recipe(
         recipe_id: str,
         ingredient_id: str,
@@ -257,19 +186,16 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     ) -> dict[str, Any]:
         """Add an ingredient to a recipe (POST /mealitem/). amount_g is in
         grams unless weight_unit_id is supplied (custom unit)."""
-        try:
-            body = api_models.MealItemRequest(
-                meal=_uuid(recipe_id, "recipe_id"),
-                ingredient=int(ingredient_id),
-                amount=_amount(amount_g),
-                weight_unit=int(weight_unit_id) if weight_unit_id is not None else UNSET,
-            )
-            item = await mealitem_create.asyncio(client=api, body=body)
-            return item.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        body = api_models.MealItemRequest(
+            meal=as_uuid(recipe_id, "recipe_id"),
+            ingredient=as_int(ingredient_id, "ingredient_id"),
+            amount=as_decimal(amount_g),
+            weight_unit=(
+                as_int(weight_unit_id, "weight_unit_id") if weight_unit_id is not None else UNSET
+            ),
+        )
+        item = await mealitem_create.asyncio(client=api, body=body)
+        return item.to_dict()
 
     # Note: wger's REST /ingredient/ endpoint is read-only (ReadOnlyModelViewSet).
     # Custom-ingredient submission previously went through wger's Django web form
@@ -278,6 +204,7 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     # docs/adr/0001-multi-user-auth-via-oidc-token-exchange.md.
 
     @mcp.tool()
+    @api_tool
     async def log_ingredient(
         plan_id: str,
         ingredient_id: str,
@@ -297,22 +224,18 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         ``meal_id`` optionally attributes the entry to a specific meal of the
         plan; omit it for a standalone diary entry.
         """
-        try:
-            body = api_models.LogItemRequest(
-                plan=_uuid(plan_id, "plan_id"),
-                ingredient=int(ingredient_id),
-                amount=_amount(amount_g),
-                datetime_=_diary_datetime(when),
-                meal=_uuid(meal_id, "meal_id") if meal_id is not None else UNSET,
-            )
-            entry = await nutritiondiary_create.asyncio(client=api, body=body)
-            return entry.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        body = api_models.LogItemRequest(
+            plan=as_uuid(plan_id, "plan_id"),
+            ingredient=as_int(ingredient_id, "ingredient_id"),
+            amount=as_decimal(amount_g),
+            datetime_=opt(at_noon(when)),
+            meal=as_uuid(meal_id, "meal_id") if meal_id is not None else UNSET,
+        )
+        entry = await nutritiondiary_create.asyncio(client=api, body=body)
+        return entry.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def update_log_item(
         log_item_id: str,
         amount_g: Annotated[float | None, Field(gt=0, le=10000)] = None,
@@ -326,25 +249,22 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         the same forms as in ``log_ingredient``; only the fields you pass are
         changed.
         """
-        try:
-            body = api_models.PatchedLogItemRequest(
-                amount=_amount(amount_g) if amount_g is not None else UNSET,
-                datetime_=_diary_datetime(when),
-                ingredient=int(ingredient_id) if ingredient_id is not None else UNSET,
-                meal=_uuid(meal_id, "meal_id") if meal_id is not None else UNSET,
-            )
-            if not body.to_dict():
-                return bad_request("no fields to update")
-            updated = await nutritiondiary_partial_update.asyncio(
-                id=_uuid(log_item_id, "log_item_id"), client=api, body=body
-            )
-            return updated.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        body = api_models.PatchedLogItemRequest(
+            amount=as_decimal(amount_g) if amount_g is not None else UNSET,
+            datetime_=opt(at_noon(when)),
+            ingredient=(
+                as_int(ingredient_id, "ingredient_id") if ingredient_id is not None else UNSET
+            ),
+            meal=as_uuid(meal_id, "meal_id") if meal_id is not None else UNSET,
+        )
+        require_fields(body)
+        updated = await nutritiondiary_partial_update.asyncio(
+            id=as_uuid(log_item_id, "log_item_id"), client=api, body=body
+        )
+        return updated.to_dict()
 
     @mcp.tool()
+    @api_list_tool
     async def list_log_items(
         when: date | None = None,
         plan_id: str | None = None,
@@ -357,30 +277,24 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
             filters["datetime_date"] = when
         if plan_id is not None:
             try:
-                filters["plan"] = _uuid(plan_id, "plan_id")
+                filters["plan"] = as_uuid(plan_id, "plan_id")
             except ValueError as exc:
                 return [bad_request(str(exc))]
         if when is None and plan_id is None:
             filters["datetime_date"] = date.today()
-        try:
-            return await paginate(nutritiondiary_list.asyncio, client=api, limit=limit, **filters)
-        except UnexpectedStatus as exc:
-            return [api_err(exc)]
+        return await paginate(nutritiondiary_list.asyncio, client=api, limit=limit, **filters)
 
     @mcp.tool()
+    @api_tool
     async def delete_log_item(log_item_id: str) -> dict[str, Any]:
         """Delete a nutrition-diary log item (a logged ingredient entry)."""
-        try:
-            await nutritiondiary_destroy.asyncio_detailed(
-                id=_uuid(log_item_id, "log_item_id"), client=api
-            )
-            return {"deleted": True, "log_item_id": log_item_id}
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        await nutritiondiary_destroy.asyncio_detailed(
+            id=as_uuid(log_item_id, "log_item_id"), client=api
+        )
+        return {"deleted": True, "log_item_id": log_item_id}
 
     @mcp.tool()
+    @api_tool
     async def calculate_daily_calories(
         weight_kg: Annotated[float | None, Field(gt=20, le=400)] = None,
         height_cm: Annotated[float | None, Field(gt=80, le=260)] = None,
@@ -435,12 +349,12 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         if need_profile or need_weight:
             try:
                 profile, latest_weights = await asyncio.gather(
-                    userprofile_list.asyncio(client=api) if need_profile else _none(),
+                    userprofile_retrieve.asyncio(client=api) if need_profile else _none(),
                     weightentry_list.asyncio(client=api, limit=1, ordering="-date")
                     if need_weight
                     else _none(),
                 )
-            except UnexpectedStatus as exc:
+            except (UnexpectedStatus, httpx.HTTPError) as exc:
                 return api_err(exc)
 
             if profile is not None:
@@ -524,19 +438,18 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
 
         if apply_to_profile:
             try:
-                patched = await _post_userprofile(
-                    api, api_models.UserprofileRequest(calories=int(target_kcal))
+                patched = await userprofile_partial_update.asyncio(
+                    client=api,
+                    body=api_models.PatchedUserprofileRequest(calories=int(target_kcal)),
                 )
-                result["profile_update"] = {
-                    "applied": True,
-                    "calories": patched.get("calories"),
-                }
-            except UnexpectedStatus as exc:
+                result["profile_update"] = {"applied": True, "calories": patched.calories}
+            except (UnexpectedStatus, httpx.HTTPError) as exc:
                 result["profile_update"] = {"applied": False, "error": api_err(exc)}
 
         return result
 
     @mcp.tool()
+    @api_tool
     async def update_user_profile(
         calories: Annotated[int | None, Field(ge=800, le=10000)] = None,
         height_cm: Annotated[int | None, Field(gt=80, le=260)] = None,
@@ -554,28 +467,25 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         intensity fields: '1'=low, '2'=moderate, '3'=high."""
         # gender/intensity are Literal types in the client; the Field patterns
         # above already restrict the values, so the strings pass through as-is
-        body = api_models.UserprofileRequest(
-            calories=calories if calories is not None else UNSET,
-            height=height_cm if height_cm is not None else UNSET,
-            birthdate=birthdate if birthdate is not None else UNSET,
-            gender=gender if gender is not None else UNSET,
-            sleep_hours=sleep_hours if sleep_hours is not None else UNSET,
-            work_hours=work_hours if work_hours is not None else UNSET,
-            work_intensity=work_intensity if work_intensity is not None else UNSET,
-            sport_hours=sport_hours if sport_hours is not None else UNSET,
-            sport_intensity=sport_intensity if sport_intensity is not None else UNSET,
-            freetime_hours=freetime_hours if freetime_hours is not None else UNSET,
-            freetime_intensity=freetime_intensity if freetime_intensity is not None else UNSET,
+        body = api_models.PatchedUserprofileRequest(
+            calories=opt(calories),
+            height=opt(height_cm),
+            birthdate=opt(birthdate),
+            gender=opt(gender),
+            sleep_hours=opt(sleep_hours),
+            work_hours=opt(work_hours),
+            work_intensity=opt(work_intensity),
+            sport_hours=opt(sport_hours),
+            sport_intensity=opt(sport_intensity),
+            freetime_hours=opt(freetime_hours),
+            freetime_intensity=opt(freetime_intensity),
         )
-        if not body.to_dict():
-            return bad_request("no fields to update")
-        try:
-            # profile updates go via POST on the collection, not PATCH
-            return await _post_userprofile(api, body)
-        except UnexpectedStatus as exc:
-            return api_err(exc)
+        require_fields(body)
+        updated = await userprofile_partial_update.asyncio(client=api, body=body)
+        return updated.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def nutrition_summary(
         when: date | None = None,
         plan_id: str | None = None,
@@ -586,13 +496,10 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         filters: dict[str, Any] = {"datetime_date": target}
         if plan_id is not None:
             try:
-                filters["plan"] = _uuid(plan_id, "plan_id")
+                filters["plan"] = as_uuid(plan_id, "plan_id")
             except ValueError as exc:
                 return bad_request(str(exc))
-        try:
-            entries = await paginate(nutritiondiary_list.asyncio, client=api, limit=500, **filters)
-        except UnexpectedStatus as exc:
-            return api_err(exc)
+        entries = await paginate(nutritiondiary_list.asyncio, client=api, limit=500, **filters)
 
         # Fan out distinct ingredient fetches concurrently.
         ing_ids: set[int] = set()
@@ -608,7 +515,7 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
                 try:
                     ing = await ingredient_retrieve.asyncio(id=iid, client=api)
                     return iid, ing.to_dict()
-                except UnexpectedStatus as exc:
+                except (UnexpectedStatus, httpx.HTTPError) as exc:
                     return iid, {"_err": api_err(exc)}
 
         cache: dict[int, dict[str, Any]] = dict(await asyncio.gather(*[_fetch(i) for i in ing_ids]))

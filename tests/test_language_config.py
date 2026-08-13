@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 import respx
 from mcp.server.fastmcp import FastMCP
@@ -14,7 +15,6 @@ from pydantic import ValidationError
 from wger_mcp.api_client import build_api_client
 from wger_mcp.config import Settings
 from wger_mcp.tools import exercises, off
-from wger_mcp.wger_client import WgerClient
 
 OFF_BASE = "https://world.openfoodfacts.org"
 WGER_API = "https://wger.test/api/v2"
@@ -137,11 +137,11 @@ def test_shape_normalizes_list_valued_fields_consistently() -> None:
 # ---------- tool wiring ----------
 
 
-def _register_off(settings: Settings) -> tuple[FastMCP, WgerClient]:
+def _register_off(settings: Settings) -> tuple[FastMCP, httpx.AsyncClient]:
     mcp = FastMCP("test")
-    client = WgerClient("https://wger.test/api/v2", _StubProvider())
-    off.register(mcp, client, settings)
-    return mcp, client
+    http = off.build_http()
+    off.register(mcp, http, settings)
+    return mcp, http
 
 
 @pytest.mark.asyncio

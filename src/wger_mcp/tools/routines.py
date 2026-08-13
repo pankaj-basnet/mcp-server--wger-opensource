@@ -8,6 +8,7 @@ import asyncio
 from datetime import date, timedelta
 from typing import Annotated, Any, NamedTuple
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 from wger_api_client import models as api_models
@@ -105,9 +106,19 @@ from wger_api_client.models.operation_enum import OPERATION_ENUM_VALUES
 from wger_api_client.models.step_enum import STEP_ENUM_VALUES
 from wger_api_client.types import UNSET
 
-from ..api_client import api_err, paginate
+from ..api_client import paginate
 from ..config import Settings
-from .common import bad_request
+from .common import (
+    ToolInputError,
+    api_err,
+    api_list_tool,
+    api_tool,
+    as_decimal,
+    as_int,
+    bad_request,
+    opt,
+    require_fields,
+)
 
 
 class _ConfigApi(NamedTuple):
@@ -166,7 +177,7 @@ CONFIG_KINDS: dict[str, _ConfigApi] = {
         rest_config_destroy,
         api_models.RestConfigRequest,
         api_models.PatchedRestConfigRequest,
-        False,
+        True,
     ),
     "max_sets": _ConfigApi(
         max_sets_config_list,
@@ -211,7 +222,7 @@ CONFIG_KINDS: dict[str, _ConfigApi] = {
         max_rest_config_destroy,
         api_models.MaxRestConfigRequest,
         api_models.PatchedMaxRestConfigRequest,
-        False,
+        True,
     ),
 }
 
@@ -223,16 +234,19 @@ STEPS = tuple(sorted(STEP_ENUM_VALUES))
 # training block.
 DEFAULT_ROUTINE_WEEKS = 12
 
-
-def _int(value: str, field: str) -> int:
-    try:
-        return int(value)
-    except ValueError:
-        raise ValueError(f"{field} must be a numeric id, got {value!r}") from None
+# Model field limits, so the caller is told before the server refuses
+ROUTINE_NAME_MAX = 25
+DAY_NAME_MAX = 20
 
 
-def _config_value(cfg: _ConfigApi, value: float) -> int | str:
-    return int(value) if cfg.int_value else f"{value:g}"
+def _config_value(cfg: _ConfigApi, kind: str, value: float) -> int | str:
+    """The wire value for a config kind: whole numbers for sets and rest
+    seconds, decimal strings for the rest."""
+    if not cfg.int_value:
+        return as_decimal(value)
+    if value != int(value):
+        raise ToolInputError(f"{kind} must be a whole number, got {value}")
+    return int(value)
 
 
 def _unknown_kind(kind: str) -> dict[str, Any]:
@@ -241,108 +255,83 @@ def _unknown_kind(kind: str) -> dict[str, Any]:
 
 def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None:
     @mcp.tool()
+    @api_list_tool
     async def list_routines(
         limit: Annotated[int, Field(ge=1, le=200)] = 20,
     ) -> list[dict[str, Any]]:
         """List the user's training routines (new wger model)."""
-        try:
-            return await paginate(routine_list.asyncio, client=api, limit=limit)
-        except UnexpectedStatus as exc:
-            return [api_err(exc)]
+        return await paginate(routine_list.asyncio, client=api, limit=limit)
 
     @mcp.tool()
+    @api_tool
     async def get_routine(routine_id: str) -> dict[str, Any]:
         """Fetch a single routine with its day structure."""
-        try:
-            routine = await routine_retrieve.asyncio(id=_int(routine_id, "routine_id"), client=api)
-            return routine.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        routine = await routine_retrieve.asyncio(id=as_int(routine_id, "routine_id"), client=api)
+        return routine.to_dict()
 
     @mcp.tool()
+    @api_list_tool
     async def list_routine_days(
         routine_id: str,
         limit: Annotated[int, Field(ge=1, le=200)] = 50,
     ) -> list[dict[str, Any]]:
         """List training days of a routine."""
-        try:
-            return await paginate(
-                day_list.asyncio,
-                client=api,
-                limit=limit,
-                routine=_int(routine_id, "routine_id"),
-                ordering="order",
-            )
-        except UnexpectedStatus as exc:
-            return [api_err(exc)]
-        except ValueError as exc:
-            return [bad_request(str(exc))]
+        return await paginate(
+            day_list.asyncio,
+            client=api,
+            limit=limit,
+            routine=as_int(routine_id, "routine_id"),
+            ordering="order",
+        )
 
     @mcp.tool()
+    @api_tool
     async def get_routine_day(day_id: str) -> dict[str, Any]:
         """Fetch a single training day."""
-        try:
-            day = await day_retrieve.asyncio(id=_int(day_id, "day_id"), client=api)
-            return day.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        day = await day_retrieve.asyncio(id=as_int(day_id, "day_id"), client=api)
+        return day.to_dict()
 
     @mcp.tool()
+    @api_list_tool
     async def list_slots(
         day_id: str,
         limit: Annotated[int, Field(ge=1, le=200)] = 50,
     ) -> list[dict[str, Any]]:
         """List slots in a training day."""
-        try:
-            return await paginate(
-                slot_list.asyncio,
-                client=api,
-                limit=limit,
-                day=_int(day_id, "day_id"),
-                ordering="order",
-            )
-        except UnexpectedStatus as exc:
-            return [api_err(exc)]
-        except ValueError as exc:
-            return [bad_request(str(exc))]
+        return await paginate(
+            slot_list.asyncio,
+            client=api,
+            limit=limit,
+            day=as_int(day_id, "day_id"),
+            ordering="order",
+        )
 
     @mcp.tool()
+    @api_list_tool
     async def list_slot_entries(
         slot_id: str,
         limit: Annotated[int, Field(ge=1, le=200)] = 50,
     ) -> list[dict[str, Any]]:
         """List exercise entries in a slot."""
-        try:
-            return await paginate(
-                slot_entry_list.asyncio,
-                client=api,
-                limit=limit,
-                slot=_int(slot_id, "slot_id"),
-                ordering="order",
-            )
-        except UnexpectedStatus as exc:
-            return [api_err(exc)]
-        except ValueError as exc:
-            return [bad_request(str(exc))]
+        return await paginate(
+            slot_entry_list.asyncio,
+            client=api,
+            limit=limit,
+            slot=as_int(slot_id, "slot_id"),
+            ordering="order",
+        )
 
     @mcp.tool()
+    @api_tool
     async def get_slot_entry(entry_id: str) -> dict[str, Any]:
         """Fetch a slot entry. Note: per-set sets/reps/weight/rir/rest are stored
         on separate *-config endpoints linked by slot_entry, not on the entry
         itself. Use list_slot_entry_configs to read them."""
-        try:
-            entry = await slot_entry_retrieve.asyncio(id=_int(entry_id, "entry_id"), client=api)
-            return entry.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        entry = await slot_entry_retrieve.asyncio(id=as_int(entry_id, "entry_id"), client=api)
+        return entry.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def list_slot_entry_configs(
         slot_entry_id: str,
         kinds: list[str] | None = None,
@@ -350,7 +339,7 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         """Fetch per-iteration configs for a slot entry. kinds filters which
         ones to read (e.g. ['sets','reps','weight']); default = all 10."""
         try:
-            entry_id = _int(slot_entry_id, "slot_entry_id")
+            entry_id = as_int(slot_entry_id, "slot_entry_id")
         except ValueError as exc:
             return bad_request(str(exc))
         targets = kinds or list(CONFIG_KINDS)
@@ -358,7 +347,7 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         async def _fetch(kind: str) -> tuple[str, Any]:
             cfg = CONFIG_KINDS.get(kind)
             if cfg is None:
-                return kind, {"error": True, "detail": f"unknown kind '{kind}'"}
+                return kind, bad_request(f"unknown kind '{kind}'")
             try:
                 return kind, await paginate(
                     cfg.list_mod.asyncio,
@@ -367,7 +356,7 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
                     slot_entry=entry_id,
                     ordering="iteration",
                 )
-            except UnexpectedStatus as exc:
+            except (UnexpectedStatus, httpx.HTTPError) as exc:
                 return kind, api_err(exc)
 
         results = await asyncio.gather(*[_fetch(k) for k in targets])
@@ -377,8 +366,9 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         return out
 
     @mcp.tool()
+    @api_tool
     async def create_routine(
-        name: Annotated[str, Field(min_length=1, max_length=255)],
+        name: Annotated[str, Field(min_length=1, max_length=ROUTINE_NAME_MAX)],
         description: str = "",
         start: date | None = None,
         end: date | None = None,
@@ -400,16 +390,14 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
             description=description,
             fit_in_week=fit_in_week,
         )
-        try:
-            created = await routine_create.asyncio(client=api, body=body)
-            return created.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
+        created = await routine_create.asyncio(client=api, body=body)
+        return created.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def update_routine(
         routine_id: str,
-        name: str | None = None,
+        name: Annotated[str | None, Field(max_length=ROUTINE_NAME_MAX)] = None,
         description: str | None = None,
         start: date | None = None,
         end: date | None = None,
@@ -417,28 +405,23 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     ) -> dict[str, Any]:
         """Patch a routine. Only provided fields are sent."""
         body = api_models.PatchedRoutineRequest(
-            name=name if name is not None else UNSET,
-            description=description if description is not None else UNSET,
-            start=start if start is not None else UNSET,
-            end=end if end is not None else UNSET,
-            fit_in_week=fit_in_week if fit_in_week is not None else UNSET,
+            name=opt(name),
+            description=opt(description),
+            start=opt(start),
+            end=opt(end),
+            fit_in_week=opt(fit_in_week),
         )
-        if not body.to_dict():
-            return bad_request("no fields to update")
-        try:
-            updated = await routine_partial_update.asyncio(
-                id=_int(routine_id, "routine_id"), client=api, body=body
-            )
-            return updated.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        require_fields(body)
+        updated = await routine_partial_update.asyncio(
+            id=as_int(routine_id, "routine_id"), client=api, body=body
+        )
+        return updated.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def add_routine_day(
         routine_id: str,
-        name: Annotated[str, Field(min_length=1, max_length=20)],
+        name: Annotated[str, Field(min_length=1, max_length=DAY_NAME_MAX)],
         order: Annotated[int, Field(ge=1, le=100)],
         description: str = "",
         is_rest: bool = False,
@@ -453,23 +436,19 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
             return bad_request(
                 f"unknown day type '{day_type}'; expected one of {', '.join(DAY_TYPES)}"
             )
-        try:
-            body = api_models.DayRequest(
-                routine=_int(routine_id, "routine_id"),
-                order=order,
-                name=name,
-                description=description,
-                is_rest=is_rest,
-                type_=day_type,
-            )
-            created = await day_create.asyncio(client=api, body=body)
-            return created.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        body = api_models.DayRequest(
+            routine=as_int(routine_id, "routine_id"),
+            order=order,
+            name=name,
+            description=description,
+            is_rest=is_rest,
+            type_=day_type,
+        )
+        created = await day_create.asyncio(client=api, body=body)
+        return created.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def add_slot_to_day(
         day_id: str,
         order: Annotated[int, Field(ge=1, le=100)],
@@ -477,19 +456,15 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     ) -> dict[str, Any]:
         """Add an exercise slot (grouping) to a day. Sets/reps/weight live on
         the *-config records of its entries, not on the slot."""
-        try:
-            body = api_models.SlotRequest(day=_int(day_id, "day_id"), order=order, comment=comment)
-            created = await slot_create.asyncio(client=api, body=body)
-            return created.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        body = api_models.SlotRequest(day=as_int(day_id, "day_id"), order=order, comment=comment)
+        created = await slot_create.asyncio(client=api, body=body)
+        return created.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def update_routine_day(
         day_id: str,
-        name: str | None = None,
+        name: Annotated[str | None, Field(max_length=DAY_NAME_MAX)] = None,
         order: Annotated[int | None, Field(ge=1, le=100)] = None,
         description: str | None = None,
         is_rest: bool | None = None,
@@ -501,25 +476,20 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
                 f"unknown day type '{day_type}'; expected one of {', '.join(DAY_TYPES)}"
             )
         body = api_models.PatchedDayRequest(
-            name=name if name is not None else UNSET,
-            order=order if order is not None else UNSET,
-            description=description if description is not None else UNSET,
-            is_rest=is_rest if is_rest is not None else UNSET,
-            type_=day_type if day_type is not None else UNSET,
+            name=opt(name),
+            order=opt(order),
+            description=opt(description),
+            is_rest=opt(is_rest),
+            type_=opt(day_type),
         )
-        if not body.to_dict():
-            return bad_request("no fields to update")
-        try:
-            updated = await day_partial_update.asyncio(
-                id=_int(day_id, "day_id"), client=api, body=body
-            )
-            return updated.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        require_fields(body)
+        updated = await day_partial_update.asyncio(
+            id=as_int(day_id, "day_id"), client=api, body=body
+        )
+        return updated.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def update_slot(
         slot_id: str,
         order: Annotated[int | None, Field(ge=1, le=100)] = None,
@@ -527,22 +497,17 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     ) -> dict[str, Any]:
         """Patch a slot."""
         body = api_models.PatchedSlotRequest(
-            order=order if order is not None else UNSET,
-            comment=comment if comment is not None else UNSET,
+            order=opt(order),
+            comment=opt(comment),
         )
-        if not body.to_dict():
-            return bad_request("no fields to update")
-        try:
-            updated = await slot_partial_update.asyncio(
-                id=_int(slot_id, "slot_id"), client=api, body=body
-            )
-            return updated.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        require_fields(body)
+        updated = await slot_partial_update.asyncio(
+            id=as_int(slot_id, "slot_id"), client=api, body=body
+        )
+        return updated.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def update_slot_entry(
         slot_entry_id: str,
         exercise_id: str | None = None,
@@ -552,26 +517,21 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         weight_unit: int | None = None,
     ) -> dict[str, Any]:
         """Patch a slot entry (the exercise binding)."""
-        try:
-            body = api_models.PatchedSlotEntryRequest(
-                exercise=(_int(exercise_id, "exercise_id") if exercise_id is not None else UNSET),
-                order=order if order is not None else UNSET,
-                comment=comment if comment is not None else UNSET,
-                repetition_unit=repetition_unit if repetition_unit is not None else UNSET,
-                weight_unit=weight_unit if weight_unit is not None else UNSET,
-            )
-            if not body.to_dict():
-                return bad_request("no fields to update")
-            updated = await slot_entry_partial_update.asyncio(
-                id=_int(slot_entry_id, "slot_entry_id"), client=api, body=body
-            )
-            return updated.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        body = api_models.PatchedSlotEntryRequest(
+            exercise=(as_int(exercise_id, "exercise_id") if exercise_id is not None else UNSET),
+            order=opt(order),
+            comment=opt(comment),
+            repetition_unit=opt(repetition_unit),
+            weight_unit=opt(weight_unit),
+        )
+        require_fields(body)
+        updated = await slot_entry_partial_update.asyncio(
+            id=as_int(slot_entry_id, "slot_entry_id"), client=api, body=body
+        )
+        return updated.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def update_slot_entry_config(
         kind: str,
         config_id: str,
@@ -592,85 +552,60 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         if step is not None and step not in STEP_ENUM_VALUES:
             return bad_request(f"step must be one of {STEPS}")
         body = cfg.patched(
-            value=_config_value(cfg, value) if value is not None else UNSET,
-            iteration=iteration if iteration is not None else UNSET,
-            operation=operation if operation is not None else UNSET,
-            step=step if step is not None else UNSET,
-            repeat=repeat if repeat is not None else UNSET,
+            value=_config_value(cfg, kind, value) if value is not None else UNSET,
+            iteration=opt(iteration),
+            operation=opt(operation),
+            step=opt(step),
+            repeat=opt(repeat),
         )
-        if not body.to_dict():
-            return bad_request("no fields to update")
-        try:
-            updated = await cfg.update_mod.asyncio(
-                id=_int(config_id, "config_id"), client=api, body=body
-            )
-            return updated.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        require_fields(body)
+        updated = await cfg.update_mod.asyncio(
+            id=as_int(config_id, "config_id"), client=api, body=body
+        )
+        return updated.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def delete_slot_entry_config(kind: str, config_id: str) -> dict[str, Any]:
         """Delete a per-iteration config record."""
         cfg = CONFIG_KINDS.get(kind)
         if cfg is None:
             return _unknown_kind(kind)
-        try:
-            await cfg.destroy_mod.asyncio_detailed(id=_int(config_id, "config_id"), client=api)
-            return {"deleted": True, "kind": kind, "config_id": config_id}
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        await cfg.destroy_mod.asyncio_detailed(id=as_int(config_id, "config_id"), client=api)
+        return {"deleted": True, "kind": kind, "config_id": config_id}
 
     @mcp.tool()
+    @api_tool
     async def delete_routine(routine_id: str) -> dict[str, Any]:
         """Delete a routine and its entire day/slot/entry tree."""
-        try:
-            await routine_destroy.asyncio_detailed(id=_int(routine_id, "routine_id"), client=api)
-            return {"deleted": True, "routine_id": routine_id}
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        await routine_destroy.asyncio_detailed(id=as_int(routine_id, "routine_id"), client=api)
+        return {"deleted": True, "routine_id": routine_id}
 
     @mcp.tool()
+    @api_tool
     async def delete_routine_day(day_id: str) -> dict[str, Any]:
         """Delete a training day (cascades to its slots and entries)."""
-        try:
-            await day_destroy.asyncio_detailed(id=_int(day_id, "day_id"), client=api)
-            return {"deleted": True, "day_id": day_id}
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        await day_destroy.asyncio_detailed(id=as_int(day_id, "day_id"), client=api)
+        return {"deleted": True, "day_id": day_id}
 
     @mcp.tool()
+    @api_tool
     async def delete_slot(slot_id: str) -> dict[str, Any]:
         """Delete a slot (cascades to its entries and configs)."""
-        try:
-            await slot_destroy.asyncio_detailed(id=_int(slot_id, "slot_id"), client=api)
-            return {"deleted": True, "slot_id": slot_id}
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        await slot_destroy.asyncio_detailed(id=as_int(slot_id, "slot_id"), client=api)
+        return {"deleted": True, "slot_id": slot_id}
 
     @mcp.tool()
+    @api_tool
     async def delete_slot_entry(slot_entry_id: str) -> dict[str, Any]:
         """Delete a slot entry (the exercise binding) and its configs."""
-        try:
-            await slot_entry_destroy.asyncio_detailed(
-                id=_int(slot_entry_id, "slot_entry_id"), client=api
-            )
-            return {"deleted": True, "slot_entry_id": slot_entry_id}
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        await slot_entry_destroy.asyncio_detailed(
+            id=as_int(slot_entry_id, "slot_entry_id"), client=api
+        )
+        return {"deleted": True, "slot_entry_id": slot_entry_id}
 
     @mcp.tool()
+    @api_tool
     async def attach_exercise_to_slot(
         slot_id: str,
         exercise_id: str,
@@ -682,23 +617,19 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         """Attach an exercise to a slot. exercise_id is the numeric wger PK
         (same id used in log_set / exerciseinfo). Per-set reps/weight live on
         sets-config / repetitions-config / weight-config records, not here."""
-        try:
-            body = api_models.SlotEntryRequest(
-                slot=_int(slot_id, "slot_id"),
-                exercise=_int(exercise_id, "exercise_id"),
-                order=order,
-                comment=comment,
-                repetition_unit=repetition_unit if repetition_unit is not None else UNSET,
-                weight_unit=weight_unit if weight_unit is not None else UNSET,
-            )
-            created = await slot_entry_create.asyncio(client=api, body=body)
-            return created.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        body = api_models.SlotEntryRequest(
+            slot=as_int(slot_id, "slot_id"),
+            exercise=as_int(exercise_id, "exercise_id"),
+            order=order,
+            comment=comment,
+            repetition_unit=opt(repetition_unit),
+            weight_unit=opt(weight_unit),
+        )
+        created = await slot_entry_create.asyncio(client=api, body=body)
+        return created.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def set_slot_entry_config(
         slot_entry_id: str,
         kind: str,
@@ -719,23 +650,19 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
             return bad_request(f"operation must be one of {OPERATIONS}")
         if step not in STEP_ENUM_VALUES:
             return bad_request(f"step must be one of {STEPS}")
-        try:
-            body = cfg.request(
-                slot_entry=_int(slot_entry_id, "slot_entry_id"),
-                iteration=iteration,
-                value=_config_value(cfg, value),
-                operation=operation,
-                step=step,
-                repeat=repeat,
-            )
-            created = await cfg.create_mod.asyncio(client=api, body=body)
-            return created.to_dict()
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError as exc:
-            return bad_request(str(exc))
+        body = cfg.request(
+            slot_entry=as_int(slot_entry_id, "slot_entry_id"),
+            iteration=iteration,
+            value=_config_value(cfg, kind, value),
+            operation=operation,
+            step=step,
+            repeat=repeat,
+        )
+        created = await cfg.create_mod.asyncio(client=api, body=body)
+        return created.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def add_exercise_with_sets(
         day_id: str,
         exercise_id: str,
@@ -747,50 +674,62 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         """High-level convenience: create slot + slot-entry + sets/reps/weight
         configs in one call. Returns the created ids. Partial failures are
         reported in the response."""
+        # Parsed up front: the slot must not be created if a later id is bad
+        day = as_int(day_id, "day_id")
+        exercise = as_int(exercise_id, "exercise_id")
+        values = [
+            (kind, _config_value(CONFIG_KINDS[kind], kind, value))
+            for kind, value in (("sets", sets), ("reps", reps), ("weight", weight_kg))
+        ]
+
         result: dict[str, Any] = {}
         try:
             slot = await slot_create.asyncio(
-                client=api,
-                body=api_models.SlotRequest(day=_int(day_id, "day_id"), order=slot_order),
+                client=api, body=api_models.SlotRequest(day=day, order=slot_order)
             )
-        except UnexpectedStatus as exc:
+        except (UnexpectedStatus, httpx.HTTPError) as exc:
             return api_err(exc) | {"stage": "slot"}
-        except ValueError as exc:
-            return bad_request(str(exc))
         result["slot"] = slot.to_dict()
 
         try:
             entry = await slot_entry_create.asyncio(
                 client=api,
                 body=api_models.SlotEntryRequest(
-                    slot=slot.id,
-                    exercise=_int(exercise_id, "exercise_id"),
-                    order=1,
-                    comment="",
+                    slot=slot.id, exercise=exercise, order=1, comment=""
                 ),
             )
-        except UnexpectedStatus as exc:
+        except (UnexpectedStatus, httpx.HTTPError) as exc:
             return result | api_err(exc) | {"stage": "slot-entry"}
-        except ValueError as exc:
-            return result | bad_request(str(exc)) | {"stage": "slot-entry"}
         result["slot_entry"] = entry.to_dict()
 
-        for kind, value in (("sets", sets), ("reps", reps), ("weight", weight_kg)):
+        # The three configs only depend on the entry, so they go out together
+        async def _config(kind: str, value: int | str) -> Any:
             cfg = CONFIG_KINDS[kind]
-            try:
-                created = await cfg.create_mod.asyncio(
-                    client=api,
-                    body=cfg.request(
-                        slot_entry=entry.id,
-                        iteration=1,
-                        value=_config_value(cfg, value),
-                        operation="r",
-                        step="abs",
-                        repeat=False,
-                    ),
-                )
-                result[f"{kind}_config"] = created.to_dict()
-            except UnexpectedStatus as exc:
-                return result | api_err(exc) | {"stage": f"{kind}-config"}
+            return await cfg.create_mod.asyncio(
+                client=api,
+                body=cfg.request(
+                    slot_entry=entry.id,
+                    iteration=1,
+                    value=value,
+                    operation="r",
+                    step="abs",
+                    repeat=False,
+                ),
+            )
+
+        created = await asyncio.gather(
+            *[_config(kind, value) for kind, value in values], return_exceptions=True
+        )
+        failed = None
+        for (kind, _), outcome in zip(values, created, strict=True):
+            if isinstance(outcome, BaseException):
+                failed = failed or (kind, outcome)
+                continue
+            result[f"{kind}_config"] = outcome.to_dict()
+        if failed is not None:
+            kind, exc = failed
+            if not isinstance(exc, UnexpectedStatus | httpx.HTTPError):
+                raise exc
+            return result | api_err(exc) | {"stage": f"{kind}-config"}
 
         return result

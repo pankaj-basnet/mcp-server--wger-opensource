@@ -1,17 +1,17 @@
 """MCP tool modules, grouped by domain.
 
-Each module exposes a ``register(mcp, <client>, settings)`` function;
-``server.build_app`` calls them all. Migrated modules take the typed
-``AuthenticatedClient``, the rest still the hand-written ``WgerClient``.
+Each wger-facing module exposes ``register(mcp, api, settings)`` on the typed
+``wger_api_client``; ``off`` talks to Open Food Facts through its own httpx
+client. ``server.build_app`` calls them all.
 """
 
 from __future__ import annotations
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from wger_api_client.client import AuthenticatedClient
 
 from ..config import Settings
-from ..wger_client import WgerClient
 from . import (
     analytics,
     body_weight,
@@ -25,11 +25,7 @@ from . import (
     workout_logs,
 )
 
-# off talks to Open Food Facts directly and only borrows the WgerClient's
-# shutdown hook; everything wger-facing uses the typed client.
-_REGISTRARS = (off.register,)
-
-_TYPED_REGISTRARS = (
+_REGISTRARS = (
     profile.register,
     routines.register,
     workout_logs.register,
@@ -43,13 +39,12 @@ _TYPED_REGISTRARS = (
 
 
 def register_all(
-    mcp: FastMCP, client: WgerClient, api: AuthenticatedClient, settings: Settings
+    mcp: FastMCP, api: AuthenticatedClient, off_http: httpx.AsyncClient, settings: Settings
 ) -> None:
     """Register every tool module on the given FastMCP instance."""
     for register in _REGISTRARS:
-        register(mcp, client, settings)
-    for register in _TYPED_REGISTRARS:
         register(mcp, api, settings)
+    off.register(mcp, off_http, settings)
 
 
 __all__ = ["register_all"]

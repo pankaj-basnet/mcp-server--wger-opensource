@@ -9,8 +9,10 @@ import pytest
 import respx
 from wger_api_client.errors import UnexpectedStatus
 
-from wger_mcp.api_client import api_err, build_api_client, paginate
+from wger_mcp import api_client
+from wger_mcp.api_client import build_api_client, paginate
 from wger_mcp.config import Settings
+from wger_mcp.tools.common import api_err
 
 
 class _StubProvider:
@@ -59,14 +61,20 @@ def _item(n: int) -> Any:
     return SimpleNamespace(to_dict=lambda n=n: {"id": n})
 
 
-def _fake_list(pages: list[tuple[int, list[Any]]]):
-    """A stand-in for a generated ``*_list.asyncio``; pops one page per call."""
+def _fake_list(total: int, *, count: int | None = None):
+    """A stand-in for a generated ``*_list.asyncio``.
+
+    Serves like the real endpoint: exactly as many items as asked for, until
+    the data runs out. ``count`` defaults to the true total; pass None for a
+    server that does not report one.
+    """
     calls: list[dict[str, Any]] = []
 
-    async def fn(*, client: Any = None, **kwargs: Any):
-        calls.append(kwargs)
-        count, items = pages.pop(0)
-        return SimpleNamespace(count=count, results=items)
+    async def fn(*, client: Any = None, limit: int, offset: int | None = None, **kwargs: Any):
+        calls.append({"limit": limit, "offset": offset, **kwargs})
+        start = offset or 0
+        items = [_item(n) for n in range(start + 1, min(start + limit, total) + 1)]
+        return SimpleNamespace(count=total if count is None else count, results=items)
 
     fn.calls = calls  # type: ignore[attr-defined]
     return fn
@@ -74,33 +82,42 @@ def _fake_list(pages: list[tuple[int, list[Any]]]):
 
 @pytest.mark.asyncio
 async def test_paginate_single_page() -> None:
-    fn = _fake_list([(2, [_item(1), _item(2)])])
+    fn = _fake_list(2)
     result = await paginate(fn, client=None, limit=10)
     assert result == [{"id": 1}, {"id": 2}]
     assert len(fn.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_paginate_follows_offsets_up_to_limit() -> None:
-    """A server page smaller than the requested limit triggers offset requests."""
-    fn = _fake_list([(5, [_item(1), _item(2)]), (5, [_item(3), _item(4)])])
-    result = await paginate(fn, client=None, limit=4)
-    assert [r["id"] for r in result] == [1, 2, 3, 4]
-    assert fn.calls[1]["offset"] == 2
+async def test_paginate_follows_offsets_up_to_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """More rows than fit in a page are collected over several offsets."""
+    monkeypatch.setattr(api_client, "_PAGE_LIMIT", 2)
+    fn = _fake_list(5)
+    result = await paginate(fn, client=None, limit=5)
+    assert [r["id"] for r in result] == [1, 2, 3, 4, 5]
+    assert [c["offset"] for c in fn.calls] == [None, 2, 4]
 
 
 @pytest.mark.asyncio
-async def test_paginate_stops_at_count() -> None:
-    """count says there is nothing more, so no request is wasted on it."""
-    fn = _fake_list([(2, [_item(1), _item(2)])])
+async def test_paginate_stops_on_a_short_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A page shorter than asked for is the last one, so nothing follows it."""
+    monkeypatch.setattr(api_client, "_PAGE_LIMIT", 2)
+    fn = _fake_list(3, count=None)
     result = await paginate(fn, client=None, limit=100)
-    assert len(result) == 2
-    assert len(fn.calls) == 1
+    assert len(result) == 3
+    assert len(fn.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_paginate_never_asks_for_more_than_the_limit() -> None:
+    fn = _fake_list(50)
+    await paginate(fn, client=None, limit=3)
+    assert fn.calls[0]["limit"] == 3
 
 
 @pytest.mark.asyncio
 async def test_paginate_passes_filters_through() -> None:
-    fn = _fake_list([(0, [])])
+    fn = _fake_list(0)
     await paginate(fn, client=None, limit=10, ordering="-datetime", plan="x")
     assert fn.calls[0]["ordering"] == "-datetime"
     assert fn.calls[0]["plan"] == "x"

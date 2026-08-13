@@ -29,8 +29,7 @@ from .auth import (
     resource_identifier,
 )
 from .config import AuthStrategy, Settings, load_settings
-from .tools import register_all
-from .wger_client import WgerClient
+from .tools import off, register_all
 
 log = logging.getLogger("wger_mcp")
 
@@ -47,11 +46,10 @@ def build_app(settings: Settings) -> Starlette:
         transport_security=transport_security,
     )
 
-    # One token provider shared by both clients; WgerClient owns (and closes) it.
     provider = build_token_provider(settings)
-    client = WgerClient(settings.wger_api_root, provider)
     api = build_api_client(settings, provider)
-    register_all(mcp, client, api, settings)
+    off_http = off.build_http()
+    register_all(mcp, api, off_http, settings)
 
     # AS facade: lets a client that treats this origin as the OAuth authorization
     # server (e.g. claude.ai) reach a private IdP. None when not in OIDC mode.
@@ -64,7 +62,8 @@ def build_app(settings: Settings) -> Starlette:
                 yield
             finally:
                 await api.get_async_httpx_client().aclose()
-                await client.aclose()
+                await off_http.aclose()
+                await provider.aclose()
                 if as_facade is not None:
                     await as_facade.aclose()
 

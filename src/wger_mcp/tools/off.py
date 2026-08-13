@@ -23,7 +23,6 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from ..config import Settings
-from ..wger_client import WgerClient
 
 _OFF_BASE_URL = "https://world.openfoodfacts.org"
 _OFF_TIMEOUT = 15.0
@@ -166,20 +165,16 @@ def _shape(prod: dict[str, Any], lang: str) -> dict[str, Any]:
     }
 
 
-def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
-    # One httpx client for OFF, lifetime-bound to the wger client via the
-    # _extra_clients hook (closed in WgerClient.aclose).
-    http = httpx.AsyncClient(
+def build_http() -> httpx.AsyncClient:
+    """The OFF client; the caller owns and closes it."""
+    return httpx.AsyncClient(
         base_url=_OFF_BASE_URL,
         timeout=_OFF_TIMEOUT,
         headers={"User-Agent": "wger-mcp/0.1 (+OFF-lookup)"},
     )
-    extras = getattr(client, "_extra_clients", None)
-    if extras is None:
-        extras = []
-        client._extra_clients = extras  # type: ignore[attr-defined]
-    extras.append(http)
 
+
+def register(mcp: FastMCP, http: httpx.AsyncClient, settings: Settings) -> None:
     default_language = settings.default_language
 
     @mcp.tool()

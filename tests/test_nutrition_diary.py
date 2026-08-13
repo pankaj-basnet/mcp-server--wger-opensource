@@ -7,7 +7,7 @@ tools call the client with the right arguments.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
@@ -61,34 +61,6 @@ class _Capture:
     @property
     def body(self) -> Any:
         return self.calls[-1]["body"]
-
-
-# ---------- _diary_timestamp ----------
-
-
-def test_none_yields_no_timestamp() -> None:
-    """Omitting the field lets wger apply its own timezone.now default."""
-    assert nutrition._diary_timestamp(None) is None
-
-
-def test_bare_date_is_anchored_at_noon() -> None:
-    assert nutrition._diary_timestamp(date(2026, 7, 21)) == "2026-07-21T12:00:00"
-
-
-def test_datetime_offset_is_preserved() -> None:
-    """The reporter's case: an explicit offset must survive verbatim."""
-    tz = timezone(timedelta(hours=2))
-    stamp = nutrition._diary_timestamp(datetime(2026, 7, 21, 7, 0, tzinfo=tz))
-    assert stamp == "2026-07-21T07:00:00+02:00"
-
-
-def test_naive_datetime_keeps_its_time() -> None:
-    assert nutrition._diary_timestamp(datetime(2026, 7, 21, 7, 30)) == "2026-07-21T07:30:00"
-
-
-def test_datetime_checked_before_date() -> None:
-    """datetime subclasses date, so a naive isinstance order would truncate."""
-    assert nutrition._diary_timestamp(datetime(2026, 7, 21, 23, 45)) != "2026-07-21T12:00:00"
 
 
 # ---------- log_ingredient ----------

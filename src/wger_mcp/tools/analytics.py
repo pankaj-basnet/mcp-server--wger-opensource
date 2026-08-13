@@ -9,17 +9,17 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from typing import Annotated, Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 from wger_api_client.api.exerciseinfo import exerciseinfo_retrieve
 from wger_api_client.api.workoutlog import workoutlog_list
 from wger_api_client.client import AuthenticatedClient
 from wger_api_client.errors import UnexpectedStatus
-from wger_api_client.types import UNSET
 
-from ..api_client import api_err, paginate
+from ..api_client import paginate
 from ..config import Settings
-from .common import bad_request
+from .common import api_tool, as_int, bad_request, opt
 
 VOLUME_METRICS: tuple[str, ...] = ("volume", "sets", "reps", "top_weight", "est_1rm")
 GROUP_BY_OPTIONS: tuple[str, ...] = ("none", "exercise", "muscle", "category")
@@ -27,6 +27,8 @@ GROUP_BY_OPTIONS: tuple[str, ...] = ("none", "exercise", "muscle", "category")
 # Exercise metadata (name/category/muscles) is effectively static per wger
 # deployment; cache it process-wide across tool invocations.
 _EX_META_CACHE: dict[int, dict[str, Any]] = {}
+# Fetched one by one: the generated client sends id__in as repeated query
+# parameters, of which wger only applies the last one
 _EX_META_CONCURRENCY = 8
 
 
@@ -82,17 +84,20 @@ async def _load_ex_meta(
     if missing:
         sem = asyncio.Semaphore(_EX_META_CONCURRENCY)
 
-        async def _fetch(eid: int) -> tuple[int, dict[str, Any]]:
+        async def _fetch(eid: int) -> tuple[int, dict[str, Any] | None]:
             async with sem:
                 try:
                     meta = await exerciseinfo_retrieve.asyncio(id=eid, client=api)
                     return eid, meta.to_dict()
-                except UnexpectedStatus:
-                    return eid, {}
+                except (UnexpectedStatus, httpx.HTTPError):
+                    return eid, None
 
+        # A failed lookup stays uncached, so a transient error is retried on the
+        # next call instead of being remembered as "this exercise has no data"
         for eid, meta in await asyncio.gather(*[_fetch(e) for e in missing]):
-            _EX_META_CACHE[eid] = meta
-    return {eid: _EX_META_CACHE[eid] for eid in ex_ids}
+            if meta is not None:
+                _EX_META_CACHE[eid] = meta
+    return {eid: _EX_META_CACHE[eid] for eid in ex_ids if eid in _EX_META_CACHE}
 
 
 def _new_metric_bucket() -> dict[str, float]:
@@ -170,23 +175,21 @@ async def _fetch_logs(
         client=api,
         limit=limit,
         ordering="date",
-        date_gte=since if since is not None else UNSET,
-        date_lt=until if until is not None else UNSET,
-        exercise=exercise if exercise is not None else UNSET,
+        date_gte=opt(since),
+        date_lt=opt(until),
+        exercise=opt(exercise),
     )
 
 
 def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None:
     @mcp.tool()
+    @api_tool
     async def weekly_summary(
         days: Annotated[int, Field(ge=1, le=90)] = 7,
     ) -> dict[str, Any]:
         """Aggregate workoutlog over the last N days: sets/reps/volume per exercise."""
         since = _since(days)
-        try:
-            logs = await _fetch_logs(api, limit=1000, since=since)
-        except UnexpectedStatus as exc:
-            return api_err(exc)
+        logs = await _fetch_logs(api, limit=1000, since=since)
 
         per_exercise: dict[int, dict[str, Any]] = defaultdict(
             lambda: {"sets": 0, "reps": 0, "volume_kg": 0.0, "dates": set()}
@@ -225,6 +228,7 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         }
 
     @mcp.tool()
+    @api_tool
     async def exercise_history(
         exercise_id: str,
         days: Annotated[int, Field(ge=1, le=730)] = 90,
@@ -233,12 +237,9 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         """Return chronological workout-log entries for one exercise over the
         last N days. Includes per-session aggregates (one session per day)."""
         since = _since(days)
-        try:
-            logs = await _fetch_logs(api, limit=limit, since=since, exercise=int(exercise_id))
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError:
-            return bad_request(f"exercise_id must be a numeric id, got {exercise_id!r}")
+        logs = await _fetch_logs(
+            api, limit=limit, since=since, exercise=as_int(exercise_id, "exercise_id")
+        )
         sessions: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"sets": 0, "reps": 0, "volume_kg": 0.0, "top_weight": 0.0, "entries": []}
         )
@@ -274,6 +275,7 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         }
 
     @mcp.tool()
+    @api_tool
     async def personal_records(
         exercise_id: str | None = None,
         days: Annotated[int, Field(ge=1, le=3650)] = 730,
@@ -282,17 +284,8 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         Epley-estimated 1RM. If exercise_id is omitted, returns one record
         block per exercise."""
         since = _since(days)
-        try:
-            logs = await _fetch_logs(
-                api,
-                limit=5000,
-                since=since,
-                exercise=int(exercise_id) if exercise_id is not None else None,
-            )
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError:
-            return bad_request(f"exercise_id must be a numeric id, got {exercise_id!r}")
+        exercise = as_int(exercise_id, "exercise_id") if exercise_id is not None else None
+        logs = await _fetch_logs(api, limit=5000, since=since, exercise=exercise)
 
         per_ex: dict[int, dict[str, Any]] = {}
         for entry in logs:
@@ -353,6 +346,7 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         }
 
     @mcp.tool()
+    @api_tool
     async def volume_trend(
         days: Annotated[int, Field(ge=1, le=730)] = 60,
         bucket: str = "week",
@@ -369,17 +363,8 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
             return bad_request(f"group_by must be one of {list(GROUP_BY_OPTIONS)}")
         selected = _select_metrics(metrics)
         since = _since(days)
-        try:
-            logs = await _fetch_logs(
-                api,
-                limit=5000,
-                since=since,
-                exercise=int(exercise_id) if exercise_id is not None else None,
-            )
-        except UnexpectedStatus as exc:
-            return api_err(exc)
-        except ValueError:
-            return bad_request(f"exercise_id must be a numeric id, got {exercise_id!r}")
+        exercise = as_int(exercise_id, "exercise_id") if exercise_id is not None else None
+        logs = await _fetch_logs(api, limit=5000, since=since, exercise=exercise)
 
         ex_cache = await _load_ex_meta(api, logs, group_by)
         buckets: dict[tuple, dict[str, float]] = defaultdict(_new_metric_bucket)
@@ -415,6 +400,7 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         }
 
     @mcp.tool()
+    @api_tool
     async def compare_periods(
         window_days: Annotated[int, Field(ge=1, le=365)] = 7,
         gap_days: Annotated[int, Field(ge=0, le=365)] = 0,
@@ -442,13 +428,10 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
 
         # Two range queries instead of one spanning the gap — when gap_days
         # is non-trivial we'd otherwise fetch (and discard) the gap window.
-        try:
-            logs_a, logs_b = await asyncio.gather(
-                _fetch_logs(api, limit=5000, since=_start(a_from), until=_end_exclusive(a_to)),
-                _fetch_logs(api, limit=5000, since=_start(b_from), until=_end_exclusive(b_to)),
-            )
-        except UnexpectedStatus as exc:
-            return api_err(exc)
+        logs_a, logs_b = await asyncio.gather(
+            _fetch_logs(api, limit=5000, since=_start(a_from), until=_end_exclusive(a_to)),
+            _fetch_logs(api, limit=5000, since=_start(b_from), until=_end_exclusive(b_to)),
+        )
 
         ex_cache = await _load_ex_meta(api, logs_a + logs_b, group_by)
         per_period: dict[str, dict[tuple | None, dict[str, float]]] = {

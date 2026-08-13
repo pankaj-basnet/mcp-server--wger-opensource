@@ -72,7 +72,7 @@ async def test_update_user_profile_passes_literal_choices(
     """gender/intensity are Literal strings in the client and pass through."""
     mcp = _register()
     post = _Capture(PROFILE)
-    monkeypatch.setattr(nutrition.userprofile_create, "asyncio", post)
+    monkeypatch.setattr(nutrition.userprofile_partial_update, "asyncio", post)
     await mcp.call_tool(
         "update_user_profile",
         {"gender": "2", "work_intensity": "3", "calories": 2000},
@@ -88,7 +88,7 @@ async def test_calculate_autofills_from_profile_and_weight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mcp = _register()
-    monkeypatch.setattr(nutrition.userprofile_list, "asyncio", _Capture(PROFILE))
+    monkeypatch.setattr(nutrition.userprofile_retrieve, "asyncio", _Capture(PROFILE))
     weights = SimpleNamespace(count=1, results=[SimpleNamespace(weight="82.5")])
     monkeypatch.setattr(nutrition.weightentry_list, "asyncio", _Capture(weights))
     result = await mcp.call_tool("calculate_daily_calories", {})

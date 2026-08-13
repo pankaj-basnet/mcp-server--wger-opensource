@@ -318,9 +318,9 @@ uv run ruff check .
 ### Source layout
 
 - [`src/wger_mcp/server.py`](src/wger_mcp/server.py) — Starlette + FastMCP wiring, lifespan, healthcheck, OAuth metadata, auth middleware.
-- [`src/wger_mcp/wger_client.py`](src/wger_mcp/wger_client.py) — async httpx wrapper. Resolves the per-request wger credential from the token provider. `paginate()` uses `count` + `next` URL to fan out remaining pages concurrently (page- or offset-style), with serial fallback for unknown formats.
+- [`src/wger_mcp/api_client.py`](src/wger_mcp/api_client.py) — bridge to the generated [`wger-api-client`](https://pypi.org/project/wger-api-client/): resolves the per-request wger credential from the token provider via a custom httpx auth, plus offset pagination over the generated `*_list` endpoints.
 - [`src/wger_mcp/auth/`](src/wger_mcp/auth/) — inbound OIDC validation (`oidc.py`, discovery in `oidc_discovery.py`), token exchange + outbound credential provider (`exchange.py`), per-request identity (`identity.py`), OAuth metadata (`oauth.py`).
-- [`src/wger_mcp/tools/`](src/wger_mcp/tools/) — one module per domain. Each exposes `register(mcp, client, settings)`; [`tools/__init__.py`](src/wger_mcp/tools/__init__.py) registers them all.
+- [`src/wger_mcp/tools/`](src/wger_mcp/tools/) — one module per domain. Each exposes `register(mcp, api, settings)`; [`tools/__init__.py`](src/wger_mcp/tools/__init__.py) registers them all.
 
 ### Performance notes
 
