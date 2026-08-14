@@ -1201,7 +1201,7 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "joserfc", specifier = ">=1.0" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.12" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.12,<2" },
     { name = "pydantic-settings", specifier = ">=2.4" },
     { name = "starlette", specifier = ">=0.37" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },

@@ -25,15 +25,25 @@ MCP → wger      Authorization: Bearer <wger JWT>  on /api/v2/*   (cached ~5 mi
 
 Provider-agnostic: JWKS/token endpoints come from the IdP's discovery document (`{issuer}/.well-known/openid-configuration`). No per-user secrets are stored — the wger access token is cached in memory and re-derived on expiry. See [docs/adr/0001-multi-user-auth-via-oidc-token-exchange.md](docs/adr/0001-multi-user-auth-via-oidc-token-exchange.md).
 
-## Quick start
+## Install
+
+The server is published on PyPI as [`wger-mcp`](https://pypi.org/project/wger-mcp/):
 
 ```bash
-git clone https://github.com/wger-project/mcp-server.git
-cd mcp-server
-uv sync
-cp .env.example .env
+uvx wger-mcp
+```
+
+`uvx` runs it without installing anything permanently; `pip install wger-mcp` (or `uv tool install wger-mcp`) puts the same `wger-mcp` command on your `PATH`. A container image is published as `ghcr.io/wger-project/mcp-server` — see [Deployment](#deployment).
+
+## Quick start
+
+Configuration comes from environment variables, or from a `.env` file in the directory you start the server in. [`.env.example`](.env.example) documents every setting.
+
+```bash
+curl -O https://raw.githubusercontent.com/wger-project/mcp-server/master/.env.example
+mv .env.example .env
 # Edit .env: set WGER_BASE_URL, OIDC_ISSUER, OIDC_CLIENT_ID/SECRET, WGER_OIDC_AUDIENCE.
-uv run wger-mcp
+uvx wger-mcp
 ```
 
 Server listens on `http://0.0.0.0:8765`, MCP endpoint at `/mcp`.
@@ -41,9 +51,18 @@ Server listens on `http://0.0.0.0:8765`, MCP endpoint at `/mcp`.
 Just trying it against your own account? The [`static_token`](#static_token--single-user-no-idp-required) strategy needs only a wger API key and no IdP:
 
 ```bash
-cp .env.example .env
 # In .env: MCP_AUTH=static_token, MCP_STATIC_TOKEN=$(openssl rand -hex 32),
 #          WGER_DEV_TOKEN=<your wger API key>, WGER_BASE_URL=<your wger>
+uvx wger-mcp
+```
+
+Running from a checkout instead (for development, see [CONTRIBUTING.md](CONTRIBUTING.md)):
+
+```bash
+git clone https://github.com/wger-project/mcp-server.git
+cd mcp-server
+uv sync
+cp .env.example .env
 uv run wger-mcp
 ```
 
