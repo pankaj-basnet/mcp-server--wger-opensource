@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -34,35 +35,42 @@ OIDC_ENV = {
     "MCP_OIDC_ALLOWED_USERS": "alice",
 }
 
-_CLEARED_VARS = (
-    "MCP_AUTH",
-    "OIDC_ISSUER",
-    "OIDC_JWKS_URI",
-    "OIDC_TOKEN_ENDPOINT",
-    "OIDC_AUTHORIZATION_ENDPOINT",
-    "OIDC_CLIENT_ID",
-    "OIDC_CLIENT_SECRET",
-    "WGER_OIDC_AUDIENCE",
-    "WGER_ALLAUTH_PROVIDER",
-    "MCP_OIDC_AUDIENCE",
-    "MCP_OIDC_ALGORITHMS",
-    "MCP_OIDC_USERNAME_CLAIM",
-    "MCP_OIDC_ALLOWED_USERS",
-    "WGER_DEV_TOKEN",
-    "MCP_STATIC_TOKEN",
-    "MCP_PUBLIC_URL",
-    "ALLOWED_HOSTS",
-    "DEFAULT_LANGUAGE",
-    "MCP_TOOLS",
-)
+# Every settings variable has to go, or the developer's shell configures the
+# suite. A prefix rule rather than a hand-kept list: keeping the list current is
+# exactly what failed when MCP_TRANSPORT and WGER_API_KEY were added, and it had
+# silently never covered OAUTH_* either.
+_SETTINGS_PREFIXES = ("WGER_", "MCP_", "OIDC_", "OAUTH_")
+#: Settings fields whose env var carries no such prefix.
+_UNPREFIXED_SETTINGS_VARS = frozenset({"ALLOWED_HOSTS", "DEFAULT_LANGUAGE", "HOST", "PORT"})
+
+
+def is_settings_var(name: str) -> bool:
+    """Whether ``name`` is an env var the settings model would read.
+
+    Compared upper-cased because pydantic-settings matches case-insensitively:
+    a lowercase ``mcp_transport`` in the environment configures the server just
+    as well, and must not survive into a test.
+    """
+    upper = name.upper()
+    return upper.startswith(_SETTINGS_PREFIXES) or upper in _UNPREFIXED_SETTINGS_VARS
+
+
+def scrubbed_env(**overrides: str) -> dict[str, str]:
+    """A copy of the environment with every settings variable removed.
+
+    For subprocess tests, which inherit the real environment rather than the
+    fixture's patched one.
+    """
+    env = {k: v for k, v in os.environ.items() if not is_settings_var(k)}
+    return {**env, **overrides}
 
 
 @pytest.fixture(autouse=True)
 def _base_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Common upstream config. Each test then sets MCP_AUTH and friends."""
-    monkeypatch.setenv("WGER_BASE_URL", "https://wger.test")
-    for var in _CLEARED_VARS:
+    for var in [k for k in os.environ if is_settings_var(k)]:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("WGER_BASE_URL", "https://wger.test")
 
 
 @pytest.fixture
@@ -111,13 +119,13 @@ def mock_jwks(jwks_dict: dict[str, Any]) -> Iterator[respx.MockRouter]:
 
 def make_client(**overrides: str) -> TestClient:
     """Build a TestClient with the given env overrides applied to the current process."""
-    import os
-
     for k, v in overrides.items():
         os.environ[k] = v
 
     from wger_mcp.config import load_settings
     from wger_mcp.server import build_app
 
-    app = build_app(load_settings())
+    # env_file=None: the fixture can only scrub os.environ, so a developer's
+    # ./.env would otherwise reach the settings by a route no test controls.
+    app = build_app(load_settings(env_file=None))
     return TestClient(app, base_url="http://localhost")

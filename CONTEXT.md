@@ -17,14 +17,14 @@ and the [[AS facade]] endpoints).
 How the MCP server proves identity to the upstream **wger** REST API. Under
 `oidc` this is per request, as the specific [[wger identity]] derived from the
 inbound credential, using a [[wger JWT]] obtained by [[Token exchange]]. Under
-the single-user strategies it is a static DRF API key (`WGER_DEV_TOKEN`) shared
+the single-user strategies it is a static DRF API key (`WGER_API_KEY`) shared
 by every request. The username/password web-form session is **removed**.
 
 ### wger identity
 
 The wger user account whose data an operation reads or writes. Under `oidc` it
 varies per request and is derived from the inbound credential; under the
-single-user strategies it is fixed (the owner of `WGER_DEV_TOKEN`).
+single-user strategies it is fixed (the owner of `WGER_API_KEY`).
 
 ### Single-user vs multi-user
 

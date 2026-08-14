@@ -42,7 +42,7 @@ class NoAuthMiddleware:
     """No-op middleware. Use only for local dev (``MCP_AUTH=none``).
 
     Binds a fixed dev :class:`Identity`; the wger client then uses the static
-    ``WGER_DEV_TOKEN`` for outbound calls.
+    ``WGER_API_KEY`` for outbound calls.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -64,7 +64,7 @@ class StaticTokenMiddleware:
     """Shared-secret bearer auth (``MCP_AUTH=static_token``).
 
     Single-user: every authenticated caller acts as the one wger account behind
-    ``WGER_DEV_TOKEN``. Unlike ``none`` this *does* gate inbound requests, so it
+    ``WGER_API_KEY``. Unlike ``none`` this *does* gate inbound requests, so it
     is safe to expose over TLS — but the secret grants full access to that
     account, so treat it like a password.
     """

@@ -7,11 +7,16 @@ An [MCP](https://modelcontextprotocol.io) server that exposes the [wger](https:/
 
 It talks to a wger instance over its public REST API — it is a separate service and requires no changes to wger itself.
 
-- **Transport:** MCP **Streamable HTTP** (FastMCP).
+- **Transport:** **stdio** for a local server your MCP client spawns, or **Streamable HTTP** (FastMCP) for a shared deployment. Pick with `--transport`.
 - **Auth:** **multi-user via OIDC SSO** — any OIDC IdP (Keycloak, Authentik, Auth0, Okta, …). Every request acts as the calling user's own wger account. For single-user self-hosting without an IdP, [`MCP_AUTH=static_token`](#static_token--single-user-no-idp-required) takes a shared secret plus your wger API key instead.
 - **Requires:** wger >= 2.6, Python >= 3.11.
 
 ## How auth works
+
+This section describes the **HTTP** deployment, where several people share one
+server. Running locally over stdio? None of it applies — skip to
+[Quick start — local, over stdio](#quick-start--local-over-stdio), where a wger
+API key is the only credential.
 
 wger 2.6 added OIDC SSO (allauth) and issues its own JWTs; its REST API only accepts wger-native credentials. So this server is **multi-user** and uses a shared OIDC identity provider (the same one wger logs in with). Per request:
 
@@ -25,7 +30,59 @@ MCP → wger      Authorization: Bearer <wger JWT>  on /api/v2/*   (cached ~5 mi
 
 Provider-agnostic: JWKS/token endpoints come from the IdP's discovery document (`{issuer}/.well-known/openid-configuration`). No per-user secrets are stored — the wger access token is cached in memory and re-derived on expiry. See [docs/adr/0001-multi-user-auth-via-oidc-token-exchange.md](docs/adr/0001-multi-user-auth-via-oidc-token-exchange.md).
 
-## Quick start
+## Quick start — local, over stdio
+
+For your own account on your own machine. The MCP client starts the server as a
+child process and talks to it over a pipe, just point it at a wger instance and
+give it an API key (wger → *Settings* → *API key*):
+
+```json
+{
+  "mcpServers": {
+    "wger": {
+      "command": "uvx",
+      "args": ["wger-mcp", "--transport", "stdio"],
+      "env": {
+        "WGER_BASE_URL": "https://wger.de",
+        "WGER_API_KEY": "<your wger API key>"
+      }
+    }
+  }
+}
+```
+
+That is the whole configuration. `WGER_API_KEY` is the one credential involved;
+it acts as your wger account, so treat it like a password.
+
+From a clone instead of PyPI, `--directory` is required — `uv run` looks for the
+project in the working directory, which belongs to the client that spawned it,
+not to you:
+
+```json
+"command": "uv",
+"args": [
+  "run",
+  "--directory", "/absolute/path/to/mcp-server",
+  "wger-mcp",
+  "--transport", "stdio"
+]
+```
+
+A few notes specific to this mode:
+
+- `MCP_AUTH` does not apply — there is no inbound request to authenticate. Setting
+  it to `oidc` is refused at startup rather than failing later on the first tool call.
+- No `.env` is read. The working directory belongs to whichever client spawned the
+  process, so a stray file there must not silently configure the server. Pass
+  `--env-file PATH` if you do want one. For the same reason the transport itself
+  cannot come from such a file — only from `--transport` or the environment — and
+  an env file that sets `MCP_TRANSPORT` is refused at startup rather than ignored.
+- Logs go to stderr; your client shows them in its MCP log. stdout is the JSON-RPC
+  stream and carries nothing else.
+- `MCP_TOOLS` works here too — see [Registering only some groups](#registering-only-some-groups)
+  if the full set of 78 tools is more than your model handles well.
+
+## Quick start — shared deployment, over HTTP
 
 ```bash
 git clone https://github.com/wger-project/mcp-server.git
@@ -43,7 +100,7 @@ Just trying it against your own account? The [`static_token`](#static_token--sin
 ```bash
 cp .env.example .env
 # In .env: MCP_AUTH=static_token, MCP_STATIC_TOKEN=$(openssl rand -hex 32),
-#          WGER_DEV_TOKEN=<your wger API key>, WGER_BASE_URL=<your wger>
+#          WGER_API_KEY=<your wger API key>, WGER_BASE_URL=<your wger>
 uv run wger-mcp
 ```
 
@@ -123,25 +180,25 @@ For self-hosting where standing up an IdP is overkill. Callers present a shared 
 ```ini
 MCP_AUTH=static_token
 MCP_STATIC_TOKEN=<openssl rand -hex 32>
-WGER_DEV_TOKEN=<your personal wger API key>
+WGER_API_KEY=<your personal wger API key>
 ```
 
 The client sends `Authorization: Bearer <MCP_STATIC_TOKEN>`.
 
 Unlike `none`, inbound requests **are** authenticated, so this is safe to expose over TLS. Caveats:
 
-- **Single-user.** Every authenticated caller acts as the one wger account behind `WGER_DEV_TOKEN`. Use `oidc` if more than one person needs access.
+- **Single-user.** Every authenticated caller acts as the one wger account behind `WGER_API_KEY`. Use `oidc` if more than one person needs access.
 - **The secret is a password.** It grants full access to that account; rotate it by changing the env var and restarting.
 - **Minimum 32 characters**, enforced at startup — a guessable secret is the entire attack surface.
 - **No MCP-native OAuth.** The OAuth discovery endpoints are deliberately not served under this strategy (a client following them would run a flow whose token this server never accepts), so configure the token out-of-band in your client.
 
 ### `none` — no inbound authentication
 
-**Anyone who can reach `/mcp` acts as the account behind `WGER_DEV_TOKEN`** — no credential required. The server logs a warning at startup.
+**Anyone who can reach `/mcp` acts as the account behind `WGER_API_KEY`** — no credential required. The server logs a warning at startup.
 
 ```ini
 MCP_AUTH=none
-WGER_DEV_TOKEN=<your personal wger API key>
+WGER_API_KEY=<your personal wger API key>
 ```
 
 Safe only when bound to localhost for local development. Never expose it to a network, even behind TLS — use `static_token` instead if you need remote access.
