@@ -10,19 +10,19 @@ endpoints.
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from importlib.metadata import version
 from typing import Any, Protocol
 
 import httpx
 from wger_api_client.client import AuthenticatedClient
 
+from . import __version__
 from .auth.exchange import WgerTokenProvider
 from .config import Settings
 
 # wger caps a page at 999 (WgerLimitOffsetPagination.max_limit)
 _PAGE_LIMIT = 999
 
-_USER_AGENT = f"wger-mcp/{version('wger-mcp')}"
+_USER_AGENT = f"wger-mcp/{__version__}"
 # Never sent: _ProviderAuth sets the header on every request. Only the unused
 # synchronous client would fall back to it.
 _UNUSED_TOKEN = "unused-async-client-authenticates-per-request"

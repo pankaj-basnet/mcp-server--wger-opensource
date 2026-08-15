@@ -1180,9 +1180,11 @@ name = "wger-mcp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "httpx" },
     { name = "joserfc" },
     { name = "mcp", extra = ["cli"] },
+    { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
@@ -1199,9 +1201,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.5" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "joserfc", specifier = ">=1.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.12,<2" },
+    { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.4" },
     { name = "starlette", specifier = ">=0.37" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },

@@ -98,7 +98,7 @@ async def test_unknown_group_is_rejected() -> None:
 def test_env_var_is_comma_separated(monkeypatch: pytest.MonkeyPatch) -> None:
     """MCP_TOOLS follows the same CSV convention as ALLOWED_HOSTS."""
     monkeypatch.setenv("MCP_AUTH", "none")
-    monkeypatch.setenv("WGER_DEV_TOKEN", "dev")
+    monkeypatch.setenv("WGER_API_KEY", "dev")
     monkeypatch.setenv("MCP_TOOLS", " Nutrition , workout_logs ")
     try:
         assert load_settings().mcp_tools == ["nutrition", "workout_logs"]

@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from wger_mcp.config import MIN_STATIC_TOKEN_LENGTH, AuthStrategy, Settings
+from wger_mcp.config import (
+    MIN_STATIC_TOKEN_LENGTH,
+    AuthStrategy,
+    Settings,
+    load_settings,
+)
 
 from .conftest import make_client
 
@@ -14,7 +19,7 @@ TOKEN = "t" * MIN_STATIC_TOKEN_LENGTH
 STATIC_ENV = {
     "MCP_AUTH": "static_token",
     "MCP_STATIC_TOKEN": TOKEN,
-    "WGER_DEV_TOKEN": "wger-api-key",
+    "WGER_API_KEY": "wger-api-key",
 }
 
 _TOOLS_LIST = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
@@ -44,11 +49,16 @@ def test_static_token_strategy_accepts_valid_config() -> None:
     assert s.mcp_static_token == TOKEN
 
 
-@pytest.mark.parametrize("missing", ["mcp_static_token", "wger_dev_token"])
-def test_static_token_requires_both_secrets(missing: str) -> None:
+@pytest.mark.parametrize(
+    ("missing", "reported"),
+    [("mcp_static_token", "MCP_STATIC_TOKEN"), ("wger_dev_token", "WGER_API_KEY")],
+)
+def test_static_token_requires_both_secrets(missing: str, reported: str) -> None:
+    """The message must name the variable the docs tell people to set, which is
+    not the field name — those parted ways when WGER_DEV_TOKEN was renamed."""
     with pytest.raises(ValidationError) as exc:
         _settings(**{missing: None})
-    assert missing.upper() in str(exc.value)
+    assert reported in str(exc.value)
 
 
 def test_short_static_token_rejected() -> None:
@@ -117,3 +127,23 @@ def test_oauth_metadata_not_advertised() -> None:
         # The AS-facade endpoints are not bypass paths under this strategy, so
         # they are refused by the auth gate rather than 404-ing.
         assert c.get("/authorize").status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"WGER_DEV_TOKEN": "legacy"}, "legacy"),
+        # AliasChoices order decides, and WGER_API_KEY is listed first.
+        ({"WGER_DEV_TOKEN": "legacy", "WGER_API_KEY": "current"}, "current"),
+    ],
+)
+def test_the_pre_rename_variable_name_still_configures_deployments(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str], expected: str
+) -> None:
+    """WGER_DEV_TOKEN is no longer documented but must keep working: it is sitting
+    in the compose files of everyone who deployed this before the rename."""
+    monkeypatch.setenv("MCP_AUTH", "none")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    assert load_settings(env_file=None).wger_dev_token == expected
