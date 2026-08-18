@@ -7,11 +7,16 @@ An [MCP](https://modelcontextprotocol.io) server that exposes the [wger](https:/
 
 It talks to a wger instance over its public REST API — it is a separate service and requires no changes to wger itself.
 
-- **Transport:** MCP **Streamable HTTP** (FastMCP).
+- **Transport:** **stdio** for a local server your MCP client spawns, or **Streamable HTTP** (FastMCP) for a shared deployment. Pick with `--transport`.
 - **Auth:** **multi-user via OIDC SSO** — any OIDC IdP (Keycloak, Authentik, Auth0, Okta, …). Every request acts as the calling user's own wger account. For single-user self-hosting without an IdP, [`MCP_AUTH=static_token`](#static_token--single-user-no-idp-required) takes a shared secret plus your wger API key instead.
 - **Requires:** wger >= 2.6, Python >= 3.11.
 
 ## How auth works
+
+This section describes the **HTTP** deployment, where several people share one
+server. Running locally over stdio? None of it applies — skip to
+[Quick start — local, over stdio](#quick-start--local-over-stdio), where a wger
+API key is the only credential.
 
 wger 2.6 added OIDC SSO (allauth) and issues its own JWTs; its REST API only accepts wger-native credentials. So this server is **multi-user** and uses a shared OIDC identity provider (the same one wger logs in with). Per request:
 
@@ -25,15 +30,77 @@ MCP → wger      Authorization: Bearer <wger JWT>  on /api/v2/*   (cached ~5 mi
 
 Provider-agnostic: JWKS/token endpoints come from the IdP's discovery document (`{issuer}/.well-known/openid-configuration`). No per-user secrets are stored — the wger access token is cached in memory and re-derived on expiry. See [docs/adr/0001-multi-user-auth-via-oidc-token-exchange.md](docs/adr/0001-multi-user-auth-via-oidc-token-exchange.md).
 
-## Quick start
+## Install
+
+The server is published on PyPI as [`wger-mcp`](https://pypi.org/project/wger-mcp/):
 
 ```bash
-git clone https://github.com/wger-project/mcp-server.git
-cd mcp-server
-uv sync
-cp .env.example .env
+uvx wger-mcp
+```
+
+`uvx` runs it without installing anything permanently; `pip install wger-mcp` (or `uv tool install wger-mcp`) puts the same `wger-mcp` command on your `PATH`. A container image is published as `ghcr.io/wger-project/mcp-server` — see [Deployment](#deployment).
+
+## Quick start — local, over stdio
+
+For your own account on your own machine. The MCP client starts the server as a
+child process and talks to it over a pipe, just point it at a wger instance and
+give it an API key (wger → *Settings* → *API key*):
+
+```json
+{
+  "mcpServers": {
+    "wger": {
+      "command": "uvx",
+      "args": ["wger-mcp", "--transport", "stdio"],
+      "env": {
+        "WGER_BASE_URL": "https://wger.de",
+        "WGER_API_KEY": "<your wger API key>"
+      }
+    }
+  }
+}
+```
+
+That is the whole configuration. `WGER_API_KEY` is the one credential involved;
+it acts as your wger account, so treat it like a password.
+
+From a clone instead of PyPI, `--directory` is required — `uv run` looks for the
+project in the working directory, which belongs to the client that spawned it,
+not to you:
+
+```json
+"command": "uv",
+"args": [
+  "run",
+  "--directory", "/absolute/path/to/mcp-server",
+  "wger-mcp",
+  "--transport", "stdio"
+]
+```
+
+A few notes specific to this mode:
+
+- `MCP_AUTH` does not apply — there is no inbound request to authenticate. Setting
+  it to `oidc` is refused at startup rather than failing later on the first tool call.
+- No `.env` is read. The working directory belongs to whichever client spawned the
+  process, so a stray file there must not silently configure the server. Pass
+  `--env-file PATH` if you do want one. For the same reason the transport itself
+  cannot come from such a file — only from `--transport` or the environment — and
+  an env file that sets `MCP_TRANSPORT` is refused at startup rather than ignored.
+- Logs go to stderr; your client shows them in its MCP log. stdout is the JSON-RPC
+  stream and carries nothing else.
+- `MCP_TOOLS` works here too — see [Registering only some groups](#registering-only-some-groups)
+  if the full set of 78 tools is more than your model handles well.
+
+## Quick start — shared deployment, over HTTP
+
+Configuration comes from environment variables, or from a `.env` file in the directory you start the server in. [`.env.example`](.env.example) documents every setting.
+
+```bash
+curl -O https://raw.githubusercontent.com/wger-project/mcp-server/master/.env.example
+mv .env.example .env
 # Edit .env: set WGER_BASE_URL, OIDC_ISSUER, OIDC_CLIENT_ID/SECRET, WGER_OIDC_AUDIENCE.
-uv run wger-mcp
+uvx wger-mcp
 ```
 
 Server listens on `http://0.0.0.0:8765`, MCP endpoint at `/mcp`.
@@ -41,9 +108,18 @@ Server listens on `http://0.0.0.0:8765`, MCP endpoint at `/mcp`.
 Just trying it against your own account? The [`static_token`](#static_token--single-user-no-idp-required) strategy needs only a wger API key and no IdP:
 
 ```bash
-cp .env.example .env
 # In .env: MCP_AUTH=static_token, MCP_STATIC_TOKEN=$(openssl rand -hex 32),
-#          WGER_DEV_TOKEN=<your wger API key>, WGER_BASE_URL=<your wger>
+#          WGER_API_KEY=<your wger API key>, WGER_BASE_URL=<your wger>
+uvx wger-mcp
+```
+
+Running from a checkout instead (for development, see [CONTRIBUTING.md](CONTRIBUTING.md)):
+
+```bash
+git clone https://github.com/wger-project/mcp-server.git
+cd mcp-server
+uv sync
+cp .env.example .env
 uv run wger-mcp
 ```
 
@@ -123,25 +199,25 @@ For self-hosting where standing up an IdP is overkill. Callers present a shared 
 ```ini
 MCP_AUTH=static_token
 MCP_STATIC_TOKEN=<openssl rand -hex 32>
-WGER_DEV_TOKEN=<your personal wger API key>
+WGER_API_KEY=<your personal wger API key>
 ```
 
 The client sends `Authorization: Bearer <MCP_STATIC_TOKEN>`.
 
 Unlike `none`, inbound requests **are** authenticated, so this is safe to expose over TLS. Caveats:
 
-- **Single-user.** Every authenticated caller acts as the one wger account behind `WGER_DEV_TOKEN`. Use `oidc` if more than one person needs access.
+- **Single-user.** Every authenticated caller acts as the one wger account behind `WGER_API_KEY`. Use `oidc` if more than one person needs access.
 - **The secret is a password.** It grants full access to that account; rotate it by changing the env var and restarting.
 - **Minimum 32 characters**, enforced at startup — a guessable secret is the entire attack surface.
 - **No MCP-native OAuth.** The OAuth discovery endpoints are deliberately not served under this strategy (a client following them would run a flow whose token this server never accepts), so configure the token out-of-band in your client.
 
 ### `none` — no inbound authentication
 
-**Anyone who can reach `/mcp` acts as the account behind `WGER_DEV_TOKEN`** — no credential required. The server logs a warning at startup.
+**Anyone who can reach `/mcp` acts as the account behind `WGER_API_KEY`** — no credential required. The server logs a warning at startup.
 
 ```ini
 MCP_AUTH=none
-WGER_DEV_TOKEN=<your personal wger API key>
+WGER_API_KEY=<your personal wger API key>
 ```
 
 Safe only when bound to localhost for local development. Never expose it to a network, even behind TLS — use `static_token` instead if you need remote access.
@@ -149,6 +225,18 @@ Safe only when bound to localhost for local development. Never expose it to a ne
 ## Tools
 
 Tools are grouped by domain. Each lives in its own module under [`src/wger_mcp/tools/`](src/wger_mcp/tools/).
+
+### Registering only some groups
+
+All 78 tools are registered by default. `MCP_TOOLS` narrows that to a comma-separated list of groups:
+
+```bash
+MCP_TOOLS=nutrition,off,profile     # a food-logging agent
+```
+
+Valid group names are the module names: `profile`, `routines`, `workout_logs`, `body_weight`, `measurements`, `equipment`, `nutrition`, `exercises`, `analytics`, `off`. An unknown name stops the server at startup rather than silently dropping tools, and repeated names are harmless.
+
+This matters most for agents driven by small local models, whose tool-selection accuracy falls off as the surface grows, and where every schema is spent from a modest context window. It is also useful for a single-purpose agent that has no business writing routines.
 
 ### Profile
 
@@ -167,24 +255,24 @@ Tools are grouped by domain. Each lives in its own module under [`src/wger_mcp/t
 | `list_routine_days(routine_id)` / `get_routine_day(day_id)` | Read day structure |
 | `add_routine_day(routine_id, name, order, description?, is_rest?, day_type?)` | Add a training day |
 | `update_routine_day(day_id, ...)` / `delete_routine_day(day_id)` | Patch / delete a day (cascade) |
-| `list_slots(day_id)` / `add_slot_to_day(day_id, order, sets?, rest_seconds?)` | List / add exercise slots |
+| `list_slots(day_id)` / `add_slot_to_day(day_id, order, comment?)` | List / add exercise slots |
 | `update_slot(slot_id, ...)` / `delete_slot(slot_id)` | Patch / delete a slot (cascade) |
 | `list_slot_entries(slot_id)` / `get_slot_entry(entry_id)` | Read exercise entries in a slot |
 | `attach_exercise_to_slot(slot_id, exercise_id, order?, repetition_unit?, weight_unit?, comment?)` | Bind an exercise to a slot |
-| `update_slot_entry(entry_id, ...)` / `delete_slot_entry(entry_id)` | Patch / delete a slot entry |
+| `update_slot_entry(slot_entry_id, ...)` / `delete_slot_entry(slot_entry_id)` | Patch / delete a slot entry |
 | `list_slot_entry_configs(slot_entry_id, kinds?)` | Read per-iteration configs (sets/reps/weight/rir/rest/max_*) |
-| `set_slot_entry_config(slot_entry_id, kind, value, iteration?, operation?, step?, repeat?)` | Add a per-iteration config record |
+| `set_slot_entry_config(slot_entry_id, kind, value, iteration?, operation?, step?, repeat?, weight_unit?)` | Add a per-iteration config record. `weight_unit` applies to `kind='weight'`/`'max_weight'` and is recorded on the slot entry |
 | `update_slot_entry_config(kind, config_id, value?, iteration?, ...)` / `delete_slot_entry_config(kind, config_id)` | Patch / delete a config record (use to bump weight on progression) |
-| `add_exercise_with_sets(day_id, exercise_id, sets, reps, weight_kg, slot_order?, rest_seconds?)` | Convenience: slot + entry + sets/reps/weight configs in one call |
-| `list_workouts` | Legacy workout plans |
+| `add_exercise_with_sets(day_id, exercise_id, sets, reps, weight?, slot_order?, weight_unit?, rir?)` | Convenience: slot + entry + sets/reps configs in one call. Omit `weight` to prescribe sets without a load |
+| `get_workout_for_date(routine_id, workout_date?)` | What the routine prescribes on a date (default today): one entry per planned SET, with exercise name, `slot_entry_id`, reps, weight and RiR. Feed its ids into `log_set` |
 
 ### Workout logs
 
 | Tool | Description |
 |------|-------------|
-| `log_set(exercise_id, reps, weight_kg, workout_log_date?, rir?)` | Add a workout log entry |
+| `log_set(exercise_id, reps, weight, workout_log_date?, rir?, weight_unit?, routine_id?, slot_entry_id?, iteration?)` | Add a workout log entry. `weight_unit` is `kg` (default) or `lb`; the weight is stored in the unit given, with no conversion. Pass `routine_id` / `slot_entry_id` / `iteration` (all from `get_workout_for_date`) to attach the set to the plan it came from — without them the log is freestanding and no routine view or routine statistic can see it |
 | `list_workout_logs(date_from?, date_to?, exercise_id?, limit?)` / `get_workout_log(log_id)` | Read entries |
-| `update_workout_log(log_id, ...)` / `delete_workout_log(log_id)` | Edit / remove an entry |
+| `update_workout_log(log_id, reps?, weight?, rir?, when?, weight_unit?)` / `delete_workout_log(log_id)` | Edit / remove an entry |
 
 ### Body weight
 
@@ -198,9 +286,10 @@ Tools are grouped by domain. Each lives in its own module under [`src/wger_mcp/t
 
 | Tool | Description |
 |------|-------------|
-| `search_exercises(query, language, limit)` | Find exercises by name (ISO 639-1 language code) |
+| `search_exercises(query, language?, limit?)` | Find exercises by name (ISO 639-1 language code). Returns id, name, category and equipment |
+| `search_exercises_batch(queries, language?, limit_per_query?)` | Resolve many names at once, one call instead of one per exercise |
 | `search_exercises_by_filter(equipment_id?, muscle_id?, category_id?, language?, limit?)` | Structured lookup (e.g. Dumbbell + Back) |
-| `get_exercise(id)` | Full exercise detail: muscles, equipment, instructions, images (with 2.6 `small`/`medium` thumbnails) |
+| `get_exercise(exercise_id)` | Full exercise detail: muscles, equipment, instructions, images (with 2.6 `small`/`medium` thumbnails) |
 | `list_categories` / `list_equipment` / `list_muscles` | Reference data |
 
 ### Ingredients
@@ -318,9 +407,9 @@ uv run ruff check .
 ### Source layout
 
 - [`src/wger_mcp/server.py`](src/wger_mcp/server.py) — Starlette + FastMCP wiring, lifespan, healthcheck, OAuth metadata, auth middleware.
-- [`src/wger_mcp/wger_client.py`](src/wger_mcp/wger_client.py) — async httpx wrapper. Resolves the per-request wger credential from the token provider. `paginate()` uses `count` + `next` URL to fan out remaining pages concurrently (page- or offset-style), with serial fallback for unknown formats.
+- [`src/wger_mcp/api_client.py`](src/wger_mcp/api_client.py) — bridge to the generated [`wger-api-client`](https://pypi.org/project/wger-api-client/): resolves the per-request wger credential from the token provider via a custom httpx auth, plus offset pagination over the generated `*_list` endpoints.
 - [`src/wger_mcp/auth/`](src/wger_mcp/auth/) — inbound OIDC validation (`oidc.py`, discovery in `oidc_discovery.py`), token exchange + outbound credential provider (`exchange.py`), per-request identity (`identity.py`), OAuth metadata (`oauth.py`).
-- [`src/wger_mcp/tools/`](src/wger_mcp/tools/) — one module per domain. Each exposes `register(mcp, client, settings)`; [`tools/__init__.py`](src/wger_mcp/tools/__init__.py) registers them all.
+- [`src/wger_mcp/tools/`](src/wger_mcp/tools/) — one module per domain. Each exposes `register(mcp, api, settings)`; [`tools/__init__.py`](src/wger_mcp/tools/__init__.py) registers them all.
 
 ### Performance notes
 

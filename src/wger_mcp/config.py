@@ -1,5 +1,14 @@
 """Settings for wger-mcp.
 
+``MCP_TRANSPORT`` picks how clients reach the server, and that decides which of
+the settings below matter:
+
+- ``stdio`` — the client spawns this process locally. No listener, no inbound
+  auth; the only credential is ``WGER_API_KEY``. Everything under *inbound auth
+  strategy* and *transport* is ignored.
+- ``http`` (default) — streamable HTTP, with the multi-user auth described
+  below.
+
 Since wger 2.6, the server is **multi-user**: every request acts as the
 caller's own wger account. Authentication has two halves that share one
 SSO identity provider (any OIDC IdP — Keycloak, Authentik, Auth0, Okta, …):
@@ -16,21 +25,25 @@ Endpoints (JWKS, token) are resolved from the IdP's discovery document
 (``{issuer}/.well-known/openid-configuration``) unless overridden.
 
 Two single-user strategies avoid the IdP entirely, both calling wger with a
-static ``WGER_DEV_TOKEN`` (a personal DRF API key):
+static ``WGER_API_KEY`` (a personal DRF API key):
 
 - ``MCP_AUTH=static_token`` — callers must present ``MCP_STATIC_TOKEN`` as a
   bearer token. Inbound requests *are* authenticated, so this is safe to expose
   over TLS; the secret grants full access to that one wger account.
 - ``MCP_AUTH=none`` — no inbound authentication at all. Anyone who can reach
-  ``/mcp`` acts as the account behind the dev token, so bind it to localhost.
+  ``/mcp`` acts as the account behind that key, so bind it to localhost.
 """
 
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Mapping
 from enum import StrEnum
+from pathlib import Path
+from typing import Any
 
-from pydantic import Field, HttpUrl, field_validator, model_validator
+from pydantic import AliasChoices, Field, HttpUrl, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Minimum length for MCP_STATIC_TOKEN. 32 chars is roughly the shortest value
@@ -44,12 +57,117 @@ class AuthStrategy(StrEnum):
     none = "none"
 
 
+class Transport(StrEnum):
+    """How the MCP client reaches this server.
+
+    ``stdio`` — the client spawns this process and speaks JSON-RPC over
+    stdin/stdout. Local and single-user: there is no listener and no inbound
+    authentication, since the client *is* the parent process. Only the outbound
+    wger credential (``WGER_API_KEY``) is configured.
+
+    ``http`` — streamable HTTP on ``HOST``/``PORT``, with one of the inbound
+    ``MCP_AUTH`` strategies. The multi-user deployment.
+    """
+
+    stdio = "stdio"
+    http = "http"
+
+
+#: Settings file read under ``http``. The single place this path is spelled out.
+DEFAULT_ENV_FILE = ".env"
+
+
+def transport_in_environ(environ: Mapping[str, str] | None = None) -> Transport | None:
+    """The transport the environment asks for, or ``None`` when it says nothing.
+
+    Separate from the default so callers can tell "unset" from "set to http" —
+    a caller that reports on an overridden value must not report on one nobody
+    set. The lookup is deliberately case-insensitive: pydantic-settings matches
+    env vars that way, and a case-sensitive one here would let
+    ``mcp_transport=stdio`` resolve to one transport and validate as the other.
+    """
+    env = os.environ if environ is None else environ
+    for key, value in env.items():
+        if key.lower() == "mcp_transport" and value.strip():
+            raw = value.strip().lower()
+            if raw not in set(Transport):
+                raise ValueError(
+                    f"MCP_TRANSPORT must be one of {', '.join(Transport)}, got {value!r}"
+                )
+            return Transport(raw)
+    return None
+
+
+def resolve_transport(
+    cli_value: str | None = None, environ: Mapping[str, str] | None = None
+) -> Transport:
+    """Decide the transport *before* any settings are loaded.
+
+    This one setting cannot come from an env file, because it is what decides
+    whether an env file is read at all. So it is resolved from the command line
+    first, then the process environment, and defaults to ``http``.
+    """
+    if cli_value:
+        return Transport(cli_value)
+    return transport_in_environ(environ) or Transport.http
+
+
+_TRANSPORT_ASSIGNMENT = re.compile(
+    r"^\s*(?:export\s+)?mcp_transport\s*=\s*['\"]?([A-Za-z]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def transport_declared_in(env_file: str | None) -> str | None:
+    """The transport an env file tries to set, if it does.
+
+    Used only to turn a setting that cannot take effect into a readable error:
+    callers pass the resolved transport as an override, so a line this pattern
+    misses costs a better message, never correct behaviour.
+    """
+    if not env_file:
+        return None
+    try:
+        text = Path(env_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = _TRANSPORT_ASSIGNMENT.search(text)
+    return match.group(1).lower() if match else None
+
+
+def env_file_for(transport: Transport, override: str | None = None) -> str | None:
+    """The settings file to read for ``transport`` — the whole policy, in one place.
+
+    ``None`` under stdio: the working directory belongs to whichever MCP client
+    spawned the process, so a file sitting there is not the user's configuration
+    and must not be treated as such. An explicit ``override`` always wins.
+
+    That override must exist. pydantic-settings skips a missing dotenv file
+    without a word, which is right for the optional default but wrong for a path
+    someone typed: a typo would otherwise start the server on whatever the
+    environment still holds — a different wger instance, a different account.
+    """
+    if override is not None:
+        if not Path(override).is_file():
+            raise FileNotFoundError(
+                f"env file not found: {override}. It was given explicitly, so it is "
+                "not treated as optional — fix the path or drop the option to fall "
+                f"back to {DEFAULT_ENV_FILE} (http) or the environment alone (stdio)."
+            )
+        return override
+    return None if transport is Transport.stdio else DEFAULT_ENV_FILE
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # No env_file default: which file to read (if any) is the transport's
+        # decision, made once in env_file_for() and passed by load_settings().
         env_file_encoding="utf-8",
         extra="ignore",
         env_prefix="",
+        # Fields with a validation_alias (wger_dev_token) are otherwise only
+        # settable through that alias, and the env source keys by field name.
+        populate_by_name=True,
     )
 
     # ---------- upstream wger ----------
@@ -88,14 +206,22 @@ class Settings(BaseSettings):
     wger_allauth_provider: str = "openid_connect"
     wger_allauth_provider_token_path: str = "/allauth/app/v1/auth/provider/token"
 
-    # ---- single-user strategies (MCP_AUTH=static_token | none) ----
+    # ---- single-user strategies (MCP_AUTH=static_token | none) and stdio ----
     # A personal wger DRF API key, sent as 'Authorization: Token <...>'.
-    wger_dev_token: str | None = None
+    # WGER_API_KEY is the name to document — it says what the value is. The
+    # older WGER_DEV_TOKEN keeps working for existing deployments.
+    wger_dev_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("WGER_API_KEY", "WGER_DEV_TOKEN"),
+    )
     # Shared secret callers must present as a bearer token under
     # MCP_AUTH=static_token. Unused by the other strategies.
     mcp_static_token: str | None = None
 
     # ---------- transport ----------
+    # Everything below this line except `mcp_transport` applies to http only.
+    mcp_transport: Transport = Transport.http
+
     host: str = "0.0.0.0"
     port: int = 8765
     mcp_path: str = "/mcp"
@@ -114,6 +240,13 @@ class Settings(BaseSettings):
 
     # DNS rebinding protection. Empty list disables the check.
     allowed_hosts: list[str] = Field(default_factory=list)
+
+    # ---------- tool surface ----------
+    # Tool groups to register, by module name (see wger_mcp.tools.TOOL_GROUPS).
+    # Empty = every group. Useful for agents driven by small local models, which
+    # lose accuracy as the tool count grows, and for single-purpose agents that
+    # need only part of the API. An unknown name is rejected at startup.
+    mcp_tools: list[str] = Field(default_factory=list)
 
     # ---------- localisation ----------
     # Default ISO 639-1 language for content lookups. Used as the default for
@@ -134,6 +267,11 @@ class Settings(BaseSettings):
         v = v.strip()
         return v if v.startswith("/") else "/" + v
 
+    @field_validator("mcp_tools", mode="after")
+    @classmethod
+    def _normalize_tools(cls, v: list[str]) -> list[str]:
+        return [t.strip().lower() for t in v if t.strip()]
+
     @field_validator("default_language", mode="after")
     @classmethod
     def _normalize_language(cls, v: str) -> str:
@@ -146,6 +284,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check_strategy_requirements(self) -> Settings:
+        if self.mcp_transport is Transport.stdio:
+            return self._check_stdio_requirements()
         if self.mcp_auth is AuthStrategy.oidc:
             missing = [
                 name
@@ -164,7 +304,7 @@ class Settings(BaseSettings):
                 name
                 for name, val in (
                     ("MCP_STATIC_TOKEN", self.mcp_static_token),
-                    ("WGER_DEV_TOKEN", self.wger_dev_token),
+                    ("WGER_API_KEY", self.wger_dev_token),
                 )
                 if not val
             ]
@@ -178,14 +318,39 @@ class Settings(BaseSettings):
                     "characters; generate one with: openssl rand -hex 32"
                 )
         elif self.mcp_auth is AuthStrategy.none and not self.wger_dev_token:
-            raise ValueError("MCP_AUTH=none requires WGER_DEV_TOKEN (a wger DRF API key)")
+            raise ValueError("MCP_AUTH=none requires WGER_API_KEY (a wger DRF API key)")
+        return self
+
+    def _check_stdio_requirements(self) -> Settings:
+        """Validate the stdio setup, where inbound auth does not exist.
+
+        The MCP client spawns this process and owns both ends of the pipe, so
+        there is nothing to authenticate: whoever can talk to us already runs as
+        the user. Only the outbound wger credential is required.
+        """
+        chosen = "mcp_auth" in self.model_fields_set
+        if chosen and self.mcp_auth is not AuthStrategy.none:
+            # Every strategy, not just oidc: quietly rewriting a chosen one would
+            # also skip the checks that come with it — MCP_AUTH=static_token used
+            # to pass here with a token http rejects as too short to be a secret.
+            raise ValueError(
+                f"MCP_TRANSPORT=stdio cannot use MCP_AUTH={self.mcp_auth.value}: "
+                "inbound authentication does not exist there, since the client "
+                "spawned this process and owns both ends of the pipe. Drop MCP_AUTH "
+                "and set WGER_API_KEY, or run with MCP_TRANSPORT=http."
+            )
+        # Only ever fills in the default, never overrides a choice — the branch
+        # above has already refused those. It says that nothing gates the pipe,
+        # and makes build_token_provider() use the static key outbound.
+        self.mcp_auth = AuthStrategy.none
+        if not self.wger_dev_token:
+            raise ValueError(
+                "MCP_TRANSPORT=stdio requires WGER_API_KEY, a wger API key from "
+                "your wger profile (Settings → API key)"
+            )
         return self
 
     # ---------- derived ----------
-    @property
-    def wger_api_root(self) -> str:
-        return str(self.wger_base_url).rstrip("/") + "/api/v2"
-
     @property
     def provider_token_url(self) -> str:
         return str(self.wger_base_url).rstrip("/") + self.wger_allauth_provider_token_path
@@ -211,10 +376,18 @@ _CSV_VARS = (
     "MCP_OIDC_ALGORITHMS",
     "MCP_OIDC_ALLOWED_USERS",
     "ALLOWED_HOSTS",
+    "MCP_TOOLS",
 )
 
 
-def load_settings() -> Settings:
+def load_settings(*, env_file: str | None = DEFAULT_ENV_FILE, **overrides: Any) -> Settings:
+    """Build :class:`Settings` from the environment.
+
+    ``env_file`` is resolved relative to the current working directory; callers
+    that know the transport should get it from :func:`env_file_for` rather than
+    deciding again. ``overrides`` take precedence over both the file and the
+    environment; ``server.main`` uses them for command-line flags.
+    """
     for var in _CSV_VARS:
         _csv_to_json_list(var)
-    return Settings()  # type: ignore[call-arg]
+    return Settings(_env_file=env_file, **overrides)  # type: ignore[call-arg]

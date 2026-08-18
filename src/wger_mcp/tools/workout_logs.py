@@ -1,71 +1,95 @@
-"""Workout log tools (per-set logging + legacy workouts)."""
+"""Workout log tools (per-set logging), via the generated ``wger_api_client``.
+
+The legacy ``list_workouts`` tool is gone; its ``/workout/`` endpoint no
+longer exists on wger >= 2.6.
+"""
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
+from wger_api_client import models as api_models
+from wger_api_client.api.workoutlog import (
+    workoutlog_create,
+    workoutlog_destroy,
+    workoutlog_list,
+    workoutlog_partial_update,
+    workoutlog_retrieve,
+)
+from wger_api_client.client import AuthenticatedClient
 
+from ..api_client import paginate
 from ..config import Settings
-from ..wger_client import WgerClient, WgerError
-from .common import bad_request, err
+from .common import (
+    ToolInputError,
+    api_list_tool,
+    api_tool,
+    as_decimal,
+    as_int,
+    as_uuid,
+    as_weight_unit,
+    at_noon,
+    opt,
+    require_fields,
+)
 
 
-def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
+def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None:
     @mcp.tool()
-    async def list_workouts(
-        limit: Annotated[int, Field(ge=1, le=200)] = 20,
-    ) -> list[dict[str, Any]]:
-        """List legacy workout plans."""
-        try:
-            return await client.paginate("workout/", limit=limit)
-        except WgerError as exc:
-            return [err(exc)]
-
-    @mcp.tool()
+    @api_tool
     async def log_set(
         exercise_id: str,
         reps: Annotated[int, Field(ge=1, le=1000)],
-        weight_kg: Annotated[float, Field(ge=0, le=1000)],
-        workout_log_date: date | None = None,
+        weight: Annotated[float, Field(ge=0, le=2000)],
+        workout_log_date: date | datetime | None = None,
         rir: Annotated[float | None, Field(ge=0, le=10)] = None,
+        weight_unit: str = "kg",
         routine_id: str | None = None,
         slot_entry_id: str | None = None,
-        iteration: Annotated[int | None, Field(ge=1)] = None,
+        iteration: Annotated[int | None, Field(ge=1, le=1000)] = None,
     ) -> dict[str, Any]:
-        """Log a completed set (workoutlog). Uses today if no date given.
+        """Log a completed set (workoutlog). Without a date, wger stamps the
+        entry with the current time; a bare date lands at 12:00.
 
-        Pass routine_id, slot_entry_id and iteration to attach the set to a
-        planned routine entry. Get all three from get_workout_for_date. Without
-        them the set is still logged, but as freestanding work that no routine
-        report can attribute.
+        weight_unit is 'kg' or 'lb'. The weight is stored in the unit given, so
+        a trainee who works in pounds gets pounds back out, with no rounding
+        drift from converting twice.
+
+        rir records Reps In Reserve for the set: how many good repetitions were
+        left. It is how wger tracks set effort.
+
+        routine_id, slot_entry_id and iteration attach the set to the plan it
+        was performed from; get all three from get_workout_for_date. Without
+        them the set is still logged and still counts towards the exercise's
+        history, but it is freestanding work: wger reads a routine's log view
+        and its statistics through the routine link, so an unattached set is
+        invisible there and in the apps that show a plan's progress.
         """
         if slot_entry_id is not None and routine_id is None:
-            return bad_request(
+            raise ToolInputError(
                 "slot_entry_id needs routine_id; both come from get_workout_for_date"
             )
-        payload: dict[str, Any] = {
-            "exercise": exercise_id,
-            "repetitions": reps,
-            "weight": weight_kg,
-            "date": (workout_log_date or date.today()).isoformat(),
-        }
-        if rir is not None:
-            payload["rir"] = rir
-        if routine_id is not None:
-            payload["routine"] = routine_id
-        if slot_entry_id is not None:
-            payload["slot_entry"] = slot_entry_id
-        if iteration is not None:
-            payload["iteration"] = iteration
-        try:
-            return await client.post("workoutlog/", json=payload)
-        except WgerError as exc:
-            return err(exc)
+        body = api_models.WorkoutLogRequest(
+            exercise=as_int(exercise_id, "exercise_id"),
+            repetitions=str(reps),
+            weight=as_decimal(weight),
+            weight_unit=as_weight_unit(weight_unit),
+            date=opt(at_noon(workout_log_date)),
+            rir=opt(as_decimal(rir) if rir is not None else None),
+            routine=opt(as_int(routine_id, "routine_id") if routine_id is not None else None),
+            slot_entry=opt(
+                as_int(slot_entry_id, "slot_entry_id") if slot_entry_id is not None else None
+            ),
+            iteration=opt(iteration),
+        )
+        created = await workoutlog_create.asyncio(client=api, body=body)
+        return created.to_dict()
 
     @mcp.tool()
+    @api_list_tool
     async def list_workout_logs(
         date_from: date | None = None,
         date_to: date | None = None,
@@ -73,56 +97,52 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         limit: Annotated[int, Field(ge=1, le=1000)] = 100,
     ) -> list[dict[str, Any]]:
         """List workout log entries (individual sets) with optional date/exercise filters."""
-        params: dict[str, Any] = {"ordering": "-date"}
+        filters: dict[str, Any] = {"ordering": "-date"}
         if date_from is not None:
-            params["date__gte"] = date_from.isoformat()
+            filters["date_gte"] = datetime.combine(date_from, time.min)
         if date_to is not None:
-            params["date__lte"] = date_to.isoformat()
+            filters["date_lt"] = datetime.combine(date_to + timedelta(days=1), time.min)
         if exercise_id is not None:
-            params["exercise"] = exercise_id
-        try:
-            return await client.paginate("workoutlog/", params=params, limit=limit)
-        except WgerError as exc:
-            return [err(exc)]
+            filters["exercise"] = as_int(exercise_id, "exercise_id")
+        return await paginate(workoutlog_list.asyncio, client=api, limit=limit, **filters)
 
     @mcp.tool()
+    @api_tool
     async def get_workout_log(log_id: str) -> dict[str, Any]:
         """Fetch one workout log entry."""
-        try:
-            return await client.get(f"workoutlog/{log_id}/")
-        except WgerError as exc:
-            return err(exc)
+        log = await workoutlog_retrieve.asyncio(id=as_uuid(log_id, "log_id"), client=api)
+        return log.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def update_workout_log(
         log_id: str,
         reps: Annotated[int | None, Field(ge=1, le=1000)] = None,
-        weight_kg: Annotated[float | None, Field(ge=0, le=1000)] = None,
+        weight: Annotated[float | None, Field(ge=0, le=2000)] = None,
         rir: Annotated[float | None, Field(ge=0, le=10)] = None,
-        when: date | None = None,
+        when: date | datetime | None = None,
+        weight_unit: str | None = None,
     ) -> dict[str, Any]:
-        """Patch a workout log entry. Only provided fields are sent."""
-        payload: dict[str, Any] = {}
-        if reps is not None:
-            payload["repetitions"] = reps
-        if weight_kg is not None:
-            payload["weight"] = weight_kg
-        if rir is not None:
-            payload["rir"] = rir
-        if when is not None:
-            payload["date"] = when.isoformat()
-        if not payload:
-            return bad_request("no fields to update")
-        try:
-            return await client.patch(f"workoutlog/{log_id}/", json=payload)
-        except WgerError as exc:
-            return err(exc)
+        """Patch a workout log entry. Only provided fields are sent.
+
+        weight_unit ('kg' or 'lb') is only sent when given, so correcting reps
+        alone leaves the recorded unit untouched.
+        """
+        log = as_uuid(log_id, "log_id")
+        body = api_models.PatchedWorkoutLogRequest(
+            repetitions=opt(str(reps) if reps is not None else None),
+            weight=opt(as_decimal(weight) if weight is not None else None),
+            weight_unit=opt(as_weight_unit(weight_unit)),
+            rir=opt(as_decimal(rir) if rir is not None else None),
+            date=opt(at_noon(when)),
+        )
+        require_fields(body)
+        updated = await workoutlog_partial_update.asyncio(id=log, client=api, body=body)
+        return updated.to_dict()
 
     @mcp.tool()
+    @api_tool
     async def delete_workout_log(log_id: str) -> dict[str, Any]:
         """Delete a workout log entry."""
-        try:
-            await client.delete(f"workoutlog/{log_id}/")
-            return {"deleted": True, "log_id": log_id}
-        except WgerError as exc:
-            return err(exc)
+        await workoutlog_destroy.asyncio_detailed(id=as_uuid(log_id, "log_id"), client=api)
+        return {"deleted": True, "log_id": log_id}

@@ -1,18 +1,25 @@
-"""Analytics tools: weekly summary, exercise history, PRs, volume trend, compare."""
+"""Analytics tools: weekly summary, exercise history, PRs, volume trend,
+compare. Reads workout logs through the generated ``wger_api_client`` and
+aggregates client-side."""
 
 from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Annotated, Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
+from wger_api_client.api.exerciseinfo import exerciseinfo_list
+from wger_api_client.api.workoutlog import workoutlog_list
+from wger_api_client.client import AuthenticatedClient
+from wger_api_client.errors import UnexpectedStatus
 
+from ..api_client import paginate
 from ..config import Settings
-from ..wger_client import WgerClient, WgerError
-from .common import bad_request, err
+from .common import api_tool, as_int, bad_request, opt
 
 VOLUME_METRICS: tuple[str, ...] = ("volume", "sets", "reps", "top_weight", "est_1rm")
 GROUP_BY_OPTIONS: tuple[str, ...] = ("none", "exercise", "muscle", "category")
@@ -20,7 +27,8 @@ GROUP_BY_OPTIONS: tuple[str, ...] = ("none", "exercise", "muscle", "category")
 # Exercise metadata (name/category/muscles) is effectively static per wger
 # deployment; cache it process-wide across tool invocations.
 _EX_META_CACHE: dict[int, dict[str, Any]] = {}
-_EX_META_CONCURRENCY = 8
+# Ids per request, so that a long history does not build an unwieldy URL
+_EX_META_BATCH = 100
 
 
 def _epley(weight: float, reps: int) -> float:
@@ -38,7 +46,7 @@ def _bucket_start(d: date, bucket: str) -> str:
 
 
 def _groups_for(
-    ex_id: str, group_by: str, ex_cache: dict[int, dict[str, Any]]
+    ex_id: int, group_by: str, ex_cache: dict[int, dict[str, Any]]
 ) -> list[tuple[int, str] | None]:
     if group_by == "none":
         return [None]
@@ -62,29 +70,31 @@ def _groups_for(
 
 
 async def _load_ex_meta(
-    client: WgerClient, log_entries: list[dict[str, Any]], group_by: str
+    api: AuthenticatedClient, log_entries: list[dict[str, Any]], group_by: str
 ) -> dict[int, dict[str, Any]]:
     if group_by == "none":
         return {}
     ex_ids: set[int] = set()
     for entry in log_entries:
-        eid = entry.get("exercise") or entry.get("exercise_base")
+        eid = entry.get("exercise")
         if isinstance(eid, int):
             ex_ids.add(eid)
     missing = [eid for eid in ex_ids if eid not in _EX_META_CACHE]
-    if missing:
-        sem = asyncio.Semaphore(_EX_META_CONCURRENCY)
 
-        async def _fetch(eid: int) -> tuple[int, dict[str, Any]]:
-            async with sem:
-                try:
-                    return eid, await client.get(f"exerciseinfo/{eid}/")
-                except WgerError:
-                    return eid, {}
+    async def _fetch(ids: list[int]) -> list[dict[str, Any]]:
+        try:
+            return await paginate(exerciseinfo_list.asyncio, client=api, limit=len(ids), id_in=ids)
+        except (UnexpectedStatus, httpx.HTTPError):
+            return []
 
-        for eid, meta in await asyncio.gather(*[_fetch(e) for e in missing]):
-            _EX_META_CACHE[eid] = meta
-    return {eid: _EX_META_CACHE[eid] for eid in ex_ids}
+    batches = [missing[i : i + _EX_META_BATCH] for i in range(0, len(missing), _EX_META_BATCH)]
+    # A failed lookup stays uncached, so a transient error is retried on the
+    # next call instead of being remembered as "this exercise has no data"
+    for metas in await asyncio.gather(*[_fetch(b) for b in batches]):
+        for meta in metas:
+            if isinstance(meta.get("id"), int):
+                _EX_META_CACHE[meta["id"]] = meta
+    return {eid: _EX_META_CACHE[eid] for eid in ex_ids if eid in _EX_META_CACHE}
 
 
 def _new_metric_bucket() -> dict[str, float]:
@@ -131,32 +141,58 @@ def _safe_float(value: Any) -> float:
 
 
 def _entry_reps(entry: dict[str, Any]) -> int:
-    # wger API returns "repetitions" (string e.g. "8.00"); older clients may send "reps"
-    raw = entry.get("repetitions") if entry.get("repetitions") is not None else entry.get("reps")
-    return int(_safe_float(raw))
+    return int(_safe_float(entry.get("repetitions")))
 
 
-def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
+def _entry_day(entry: dict[str, Any]) -> date | None:
+    """The calendar day of a log entry; its ``date`` is a full timestamp."""
+    raw = entry.get("date")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw).date()
+    except ValueError:
+        return None
+
+
+def _since(days: int) -> datetime:
+    return datetime.combine(date.today() - timedelta(days=days - 1), time.min)
+
+
+async def _fetch_logs(
+    api: AuthenticatedClient,
+    *,
+    limit: int,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    exercise: int | None = None,
+) -> list[dict[str, Any]]:
+    return await paginate(
+        workoutlog_list.asyncio,
+        client=api,
+        limit=limit,
+        ordering="date",
+        date_gte=opt(since),
+        date_lt=opt(until),
+        exercise=opt(exercise),
+    )
+
+
+def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None:
     @mcp.tool()
+    @api_tool
     async def weekly_summary(
         days: Annotated[int, Field(ge=1, le=90)] = 7,
     ) -> dict[str, Any]:
         """Aggregate workoutlog over the last N days: sets/reps/volume per exercise."""
-        since = (date.today() - timedelta(days=days - 1)).isoformat()
-        try:
-            logs = await client.paginate(
-                "workoutlog/",
-                params={"date__gte": since, "ordering": "date"},
-                limit=1000,
-            )
-        except WgerError as exc:
-            return err(exc)
+        since = _since(days)
+        logs = await _fetch_logs(api, limit=1000, since=since)
 
         per_exercise: dict[int, dict[str, Any]] = defaultdict(
             lambda: {"sets": 0, "reps": 0, "volume_kg": 0.0, "dates": set()}
         )
         for entry in logs:
-            ex_id = entry.get("exercise") or entry.get("exercise_base")
+            ex_id = entry.get("exercise")
             if ex_id is None:
                 continue
             reps = _entry_reps(entry)
@@ -165,7 +201,7 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
             bucket["sets"] += 1
             bucket["reps"] += reps
             bucket["volume_kg"] += reps * weight
-            if d := entry.get("date"):
+            if d := _entry_day(entry):
                 bucket["dates"].add(d)
 
         breakdown = [
@@ -181,7 +217,7 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
             )
         ]
         return {
-            "since": since,
+            "since": since.date().isoformat(),
             "until": date.today().isoformat(),
             "total_sets": sum(v["sets"] for v in per_exercise.values()),
             "total_volume_kg": round(sum(v["volume_kg"] for v in per_exercise.values()), 2),
@@ -189,43 +225,41 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         }
 
     @mcp.tool()
+    @api_tool
     async def exercise_history(
         exercise_id: str,
         days: Annotated[int, Field(ge=1, le=730)] = 90,
         limit: Annotated[int, Field(ge=1, le=2000)] = 500,
     ) -> dict[str, Any]:
         """Return chronological workout-log entries for one exercise over the
-        last N days. Includes per-session aggregates."""
-        since = (date.today() - timedelta(days=days - 1)).isoformat()
-        try:
-            logs = await client.paginate(
-                "workoutlog/",
-                params={"exercise": exercise_id, "date__gte": since, "ordering": "date"},
-                limit=limit,
-            )
-        except WgerError as exc:
-            return err(exc)
+        last N days. Includes per-session aggregates (one session per day)."""
+        since = _since(days)
+        logs = await _fetch_logs(
+            api, limit=limit, since=since, exercise=as_int(exercise_id, "exercise_id")
+        )
         sessions: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"sets": 0, "reps": 0, "volume_kg": 0.0, "top_weight": 0.0, "entries": []}
         )
         for entry in logs:
             weight = _safe_float(entry.get("weight"))
             reps = _entry_reps(entry)
-            d = entry.get("date") or ""
-            b = sessions[d]
+            day = _entry_day(entry)
+            b = sessions[day.isoformat() if day else ""]
             b["sets"] += 1
             b["reps"] += reps
             b["volume_kg"] += reps * weight
             b["top_weight"] = max(b["top_weight"], weight)
-            b["entries"].append({
-                "id": entry.get("id"),
-                "reps": reps,
-                "weight": weight,
-                "rir": entry.get("rir"),
-            })
+            b["entries"].append(
+                {
+                    "id": entry.get("id"),
+                    "reps": reps,
+                    "weight": weight,
+                    "rir": entry.get("rir"),
+                }
+            )
         return {
             "exercise_id": exercise_id,
-            "since": since,
+            "since": since.date().isoformat(),
             "until": date.today().isoformat(),
             "total_sets": sum(s["sets"] for s in sessions.values()),
             "sessions": [
@@ -238,6 +272,7 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         }
 
     @mcp.tool()
+    @api_tool
     async def personal_records(
         exercise_id: str | None = None,
         days: Annotated[int, Field(ge=1, le=3650)] = 730,
@@ -245,23 +280,20 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         """Compute PRs from workout logs: max weight, max reps, best
         Epley-estimated 1RM. If exercise_id is omitted, returns one record
         block per exercise."""
-        since = (date.today() - timedelta(days=days - 1)).isoformat()
-        params: dict[str, Any] = {"date__gte": since, "ordering": "date"}
-        if exercise_id is not None:
-            params["exercise"] = exercise_id
-        try:
-            logs = await client.paginate("workoutlog/", params=params, limit=5000)
-        except WgerError as exc:
-            return err(exc)
+        since = _since(days)
+        exercise = as_int(exercise_id, "exercise_id") if exercise_id is not None else None
+        logs = await _fetch_logs(api, limit=5000, since=since, exercise=exercise)
 
         per_ex: dict[int, dict[str, Any]] = {}
         for entry in logs:
-            ex_id = entry.get("exercise") or entry.get("exercise_base")
+            ex_id = entry.get("exercise")
             if ex_id is None:
                 continue
             weight = _safe_float(entry.get("weight"))
             reps = _entry_reps(entry)
             est_1rm = _epley(weight, reps)
+            day = _entry_day(entry)
+            day_str = day.isoformat() if day else None
             rec = per_ex.setdefault(
                 ex_id,
                 {
@@ -281,14 +313,14 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
                 rec["max_weight"] = {
                     "value": weight,
                     "reps": reps,
-                    "date": entry.get("date"),
+                    "date": day_str,
                     "log_id": entry.get("id"),
                 }
             if reps > rec["max_reps"]["value"]:
                 rec["max_reps"] = {
                     "value": reps,
                     "weight": weight,
-                    "date": entry.get("date"),
+                    "date": day_str,
                     "log_id": entry.get("id"),
                 }
             if est_1rm > rec["best_est_1rm"]["value"]:
@@ -296,12 +328,12 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
                     "value": round(est_1rm, 2),
                     "weight": weight,
                     "reps": reps,
-                    "date": entry.get("date"),
+                    "date": day_str,
                     "log_id": entry.get("id"),
                 }
 
         return {
-            "since": since,
+            "since": since.date().isoformat(),
             "until": date.today().isoformat(),
             "records": sorted(
                 per_ex.values(),
@@ -311,6 +343,7 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         }
 
     @mcp.tool()
+    @api_tool
     async def volume_trend(
         days: Annotated[int, Field(ge=1, le=730)] = 60,
         bucket: str = "week",
@@ -326,29 +359,20 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         if group_by not in GROUP_BY_OPTIONS:
             return bad_request(f"group_by must be one of {list(GROUP_BY_OPTIONS)}")
         selected = _select_metrics(metrics)
-        since = date.today() - timedelta(days=days - 1)
-        params: dict[str, Any] = {"date__gte": since.isoformat(), "ordering": "date"}
-        if exercise_id is not None:
-            params["exercise"] = exercise_id
-        try:
-            logs = await client.paginate("workoutlog/", params=params, limit=5000)
-        except WgerError as exc:
-            return err(exc)
+        since = _since(days)
+        exercise = as_int(exercise_id, "exercise_id") if exercise_id is not None else None
+        logs = await _fetch_logs(api, limit=5000, since=since, exercise=exercise)
 
-        ex_cache = await _load_ex_meta(client, logs, group_by)
+        ex_cache = await _load_ex_meta(api, logs, group_by)
         buckets: dict[tuple, dict[str, float]] = defaultdict(_new_metric_bucket)
         for entry in logs:
-            ex_id = entry.get("exercise") or entry.get("exercise_base")
-            d_str = entry.get("date")
-            if ex_id is None or not d_str:
+            ex_id = entry.get("exercise")
+            day = _entry_day(entry)
+            if ex_id is None or day is None:
                 continue
             weight = _safe_float(entry.get("weight"))
             reps = _entry_reps(entry)
-            try:
-                d = date.fromisoformat(d_str)
-            except ValueError:
-                continue
-            bkt = _bucket_start(d, bucket)
+            bkt = _bucket_start(day, bucket)
             for group in _groups_for(ex_id, group_by, ex_cache):
                 key = (bkt, group)
                 _accumulate(buckets[key], reps, weight)
@@ -364,7 +388,7 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
             series.append(row)
 
         return {
-            "since": since.isoformat(),
+            "since": since.date().isoformat(),
             "until": date.today().isoformat(),
             "bucket": bucket,
             "group_by": group_by,
@@ -373,6 +397,7 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         }
 
     @mcp.tool()
+    @api_tool
     async def compare_periods(
         window_days: Annotated[int, Field(ge=1, le=365)] = 7,
         gap_days: Annotated[int, Field(ge=0, le=365)] = 0,
@@ -392,33 +417,20 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         b_to = a_from - timedelta(days=1 + gap_days)
         b_from = b_to - timedelta(days=window_days - 1)
 
+        def _start(d: date) -> datetime:
+            return datetime.combine(d, time.min)
+
+        def _end_exclusive(d: date) -> datetime:
+            return datetime.combine(d + timedelta(days=1), time.min)
+
         # Two range queries instead of one spanning the gap — when gap_days
         # is non-trivial we'd otherwise fetch (and discard) the gap window.
-        try:
-            logs_a, logs_b = await asyncio.gather(
-                client.paginate(
-                    "workoutlog/",
-                    params={
-                        "date__gte": a_from.isoformat(),
-                        "date__lte": a_to.isoformat(),
-                        "ordering": "date",
-                    },
-                    limit=5000,
-                ),
-                client.paginate(
-                    "workoutlog/",
-                    params={
-                        "date__gte": b_from.isoformat(),
-                        "date__lte": b_to.isoformat(),
-                        "ordering": "date",
-                    },
-                    limit=5000,
-                ),
-            )
-        except WgerError as exc:
-            return err(exc)
+        logs_a, logs_b = await asyncio.gather(
+            _fetch_logs(api, limit=5000, since=_start(a_from), until=_end_exclusive(a_to)),
+            _fetch_logs(api, limit=5000, since=_start(b_from), until=_end_exclusive(b_to)),
+        )
 
-        ex_cache = await _load_ex_meta(client, logs_a + logs_b, group_by)
+        ex_cache = await _load_ex_meta(api, logs_a + logs_b, group_by)
         per_period: dict[str, dict[tuple | None, dict[str, float]]] = {
             "a": defaultdict(_new_metric_bucket),
             "b": defaultdict(_new_metric_bucket),
@@ -429,7 +441,7 @@ def register(mcp: FastMCP, client: WgerClient, settings: Settings) -> None:
         }
         for period, logs in (("a", logs_a), ("b", logs_b)):
             for entry in logs:
-                ex_id = entry.get("exercise") or entry.get("exercise_base")
+                ex_id = entry.get("exercise")
                 if ex_id is None:
                     continue
                 weight = _safe_float(entry.get("weight"))
