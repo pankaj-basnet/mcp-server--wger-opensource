@@ -19,6 +19,7 @@ from wger_api_client.api.day import (
     day_partial_update,
     day_retrieve,
 )
+from wger_api_client.api.exercise_translation import exercise_translation_list
 from wger_api_client.api.max_repetitions_config import (
     max_repetitions_config_create,
     max_repetitions_config_destroy,
@@ -69,6 +70,7 @@ from wger_api_client.api.rir_config import (
 )
 from wger_api_client.api.routine import (
     routine_create,
+    routine_date_sequence_gym_list,
     routine_destroy,
     routine_list,
     routine_partial_update,
@@ -104,7 +106,7 @@ from wger_api_client.errors import UnexpectedStatus
 from wger_api_client.models.day_type_enum import DAY_TYPE_ENUM_VALUES
 from wger_api_client.models.operation_enum import OPERATION_ENUM_VALUES
 from wger_api_client.models.step_enum import STEP_ENUM_VALUES
-from wger_api_client.types import UNSET
+from wger_api_client.types import UNSET, Unset
 
 from ..api_client import paginate
 from ..config import Settings
@@ -117,8 +119,10 @@ from .common import (
     as_int,
     as_weight_unit,
     bad_request,
+    language_id_resolver,
     opt,
     require_fields,
+    weight_unit_name,
 )
 
 
@@ -255,6 +259,37 @@ def _unknown_kind(kind: str) -> dict[str, Any]:
 
 
 def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None:
+    _language_id_for = language_id_resolver(api)
+    # Exercise names live on translations, not on the exercise itself, and the
+    # plan endpoints carry ids only. Resolved here so "what am I doing today"
+    # answers with names: the alternative is the caller fetching a full
+    # exerciseinfo record per exercise, which costs it far more context than
+    # the one short string added per set here. Cached for the process, since
+    # exercise names are static content.
+    _name_cache: dict[int, str] = {}
+
+    async def _cache_name(exercise_id: int, language_id: int | None) -> None:
+        try:
+            rows = await paginate(
+                exercise_translation_list.asyncio, client=api, limit=50, exercise=exercise_id
+            )
+        except (UnexpectedStatus, httpx.HTTPError):
+            return  # a name that will not resolve must not fail the whole plan
+        named = [r for r in rows if isinstance(r, dict) and r.get("name")]
+        best = next((r["name"] for r in named if r.get("language") == language_id), None)
+        # Any translation still beats handing back a bare id.
+        if best is None and named:
+            best = named[0]["name"]
+        if best:
+            _name_cache[exercise_id] = best
+
+    async def _exercise_names(exercise_ids: set[int]) -> dict[int, str]:
+        missing = exercise_ids - _name_cache.keys()
+        if missing:
+            language_id = await _language_id_for(settings.default_language)
+            await asyncio.gather(*[_cache_name(i, language_id) for i in missing])
+        return {i: _name_cache[i] for i in exercise_ids if i in _name_cache}
+
     @mcp.tool()
     @api_list_tool
     async def list_routines(
@@ -269,6 +304,81 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         """Fetch a single routine with its day structure."""
         routine = await routine_retrieve.asyncio(id=as_int(routine_id, "routine_id"), client=api)
         return routine.to_dict()
+
+    @mcp.tool()
+    @api_tool
+    async def get_workout_for_date(
+        routine_id: str,
+        workout_date: date | None = None,
+    ) -> dict[str, Any]:
+        """What the routine prescribes on a given date. Defaults to today.
+
+        Returns the day's label, its iteration, and one entry per planned SET
+        — an exercise prescribed for three sets appears three times, which is
+        wger's gym-mode view: each entry is one set to perform and then log.
+        Each carries the exercise name, its slot_entry_id, and the planned
+        repetitions, weight and RiR. Feed routine_id, slot_entry_id and
+        iteration straight into log_set so the logged set attaches to the plan.
+
+        This is the one call that answers "what am I doing today" and "what is
+        in this program". Walking days, slots, entries and their configs costs
+        dozens of requests and returns far more than anyone needs.
+
+        A rest day returns planned: [] with is_rest_day true.
+        """
+        target = workout_date or date.today()
+        sequence = await routine_date_sequence_gym_list.asyncio(
+            id=as_int(routine_id, "routine_id"), client=api
+        )
+        for entry in sequence or []:
+            if entry.date != target:
+                continue
+            planned: list[dict[str, Any]] = [
+                {
+                    "slot_entry_id": cfg.slot_entry_id,
+                    "exercise_id": cfg.exercise,
+                    "sets": cfg.sets,
+                    "repetitions": cfg.repetitions,
+                    "weight": cfg.weight,
+                    "weight_unit": weight_unit_name(cfg.weight_unit),
+                    "rir": cfg.rir,
+                    "rest": cfg.rest,
+                    "text_repr": cfg.text_repr,
+                }
+                for slot in entry.slots
+                for cfg in slot.sets
+            ]
+            names = await _exercise_names(
+                {p["exercise_id"] for p in planned if p["exercise_id"] is not None}
+            )
+            for p in planned:
+                p["exercise_name"] = names.get(p["exercise_id"])
+            day = entry.day
+            return {
+                "routine_id": routine_id,
+                "date": entry.date.isoformat(),
+                "iteration": entry.iteration,
+                "label": entry.label,
+                "day_id": day.id,
+                # A day need not be named, and Unset would not survive the
+                # tool boundary as JSON.
+                "day_name": None if isinstance(day.name, Unset) else day.name,
+                "is_rest_day": (day.is_rest is True) or not planned,
+                "planned": planned,
+            }
+
+        # Outside the routine's date range, or it schedules no day on that date.
+        return {
+            "routine_id": routine_id,
+            "date": target.isoformat(),
+            "iteration": None,
+            "label": None,
+            "day_id": None,
+            "day_name": None,
+            "is_rest_day": True,
+            "planned": [],
+            "note": "no scheduled day on this date - it may fall outside the routine's range",
+        }
 
     @mcp.tool()
     @api_list_tool

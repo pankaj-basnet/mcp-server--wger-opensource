@@ -24,6 +24,7 @@ from wger_api_client.client import AuthenticatedClient
 from ..api_client import paginate
 from ..config import Settings
 from .common import (
+    ToolInputError,
     api_list_tool,
     api_tool,
     as_decimal,
@@ -46,6 +47,9 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
         workout_log_date: date | datetime | None = None,
         rir: Annotated[float | None, Field(ge=0, le=10)] = None,
         weight_unit: str = "kg",
+        routine_id: str | None = None,
+        slot_entry_id: str | None = None,
+        iteration: Annotated[int | None, Field(ge=1, le=1000)] = None,
     ) -> dict[str, Any]:
         """Log a completed set (workoutlog). Without a date, wger stamps the
         entry with the current time; a bare date lands at 12:00.
@@ -56,7 +60,18 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
 
         rir records Reps In Reserve for the set: how many good repetitions were
         left. It is how wger tracks set effort.
+
+        routine_id, slot_entry_id and iteration attach the set to the plan it
+        was performed from; get all three from get_workout_for_date. Without
+        them the set is still logged and still counts towards the exercise's
+        history, but it is freestanding work: wger reads a routine's log view
+        and its statistics through the routine link, so an unattached set is
+        invisible there and in the apps that show a plan's progress.
         """
+        if slot_entry_id is not None and routine_id is None:
+            raise ToolInputError(
+                "slot_entry_id needs routine_id; both come from get_workout_for_date"
+            )
         body = api_models.WorkoutLogRequest(
             exercise=as_int(exercise_id, "exercise_id"),
             repetitions=str(reps),
@@ -64,6 +79,11 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
             weight_unit=as_weight_unit(weight_unit),
             date=opt(at_noon(workout_log_date)),
             rir=opt(as_decimal(rir) if rir is not None else None),
+            routine=opt(as_int(routine_id, "routine_id") if routine_id is not None else None),
+            slot_entry=opt(
+                as_int(slot_entry_id, "slot_entry_id") if slot_entry_id is not None else None
+            ),
+            iteration=opt(iteration),
         )
         created = await workoutlog_create.asyncio(client=api, body=body)
         return created.to_dict()

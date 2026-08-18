@@ -10,8 +10,12 @@ from typing import Any, Protocol, TypeVar
 from uuid import UUID
 
 import httpx
+from wger_api_client.api.language import language_list
+from wger_api_client.client import AuthenticatedClient
 from wger_api_client.errors import UnexpectedStatus
 from wger_api_client.types import UNSET, Unset
+
+from ..api_client import paginate
 
 T = TypeVar("T")
 
@@ -23,6 +27,7 @@ _BARE_DATE_TIME = time(12, 0)
 # routine authoring, which record the unit in different places: a workout log
 # carries its own weight_unit, while a planned set takes it from its slot entry.
 WEIGHT_UNITS: dict[str, int] = {"kg": 1, "lb": 2}
+_WEIGHT_UNIT_NAMES: dict[int, str] = {v: k for k, v in WEIGHT_UNITS.items()}
 
 
 class ToolInputError(Exception):
@@ -81,6 +86,42 @@ def as_weight_unit(unit: str | None) -> int | None:
         raise ToolInputError(
             f"unknown weight_unit '{unit}'; expected one of {', '.join(WEIGHT_UNITS)}"
         ) from None
+
+
+def weight_unit_name(unit_id: Any) -> Any:
+    """Render wger's numeric weight unit as its code, for data going out.
+
+    A plan is read by people and by language models, and ``weight_unit: 1``
+    invites both to guess — one assistant reported a 14 kg set as "14 lb".
+    Units this server does not name (Body Weight, Plates, km/h, ...) pass
+    through unchanged rather than being labelled wrongly.
+    """
+    return _WEIGHT_UNIT_NAMES.get(unit_id, unit_id)
+
+
+def language_id_resolver(api: AuthenticatedClient) -> Callable[[str], Awaitable[int | None]]:
+    """A cached lookup of wger's numeric id for a language code.
+
+    Exercise names live on translations, which carry the language as an id, so
+    picking the name in the language the caller asked for needs this mapping.
+    Cached per resolver: the language table is static. A failed lookup returns
+    ``None`` and is not cached, leaving the caller to fall back to whatever
+    translation comes first instead of failing.
+    """
+    cache: dict[str, int | None] = {}
+
+    async def resolve(code: str) -> int | None:
+        if code not in cache:
+            try:
+                rows = await paginate(language_list.asyncio, client=api, limit=5, short_name=code)
+            except (UnexpectedStatus, httpx.HTTPError):
+                return None
+            cache[code] = next(
+                (r.get("id") for r in rows if isinstance(r, dict) and r.get("id")), None
+            )
+        return cache[code]
+
+    return resolve
 
 
 def at_noon(when: date | datetime | None) -> datetime | None:

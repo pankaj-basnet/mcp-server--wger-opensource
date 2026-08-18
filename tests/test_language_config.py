@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 from wger_mcp.api_client import build_api_client
 from wger_mcp.config import Settings
-from wger_mcp.tools import exercises, off
+from wger_mcp.tools import common, exercises, off
 
 OFF_BASE = "https://world.openfoodfacts.org"
 WGER_API = "https://wger.test/api/v2"
@@ -222,7 +222,7 @@ async def test_exercise_search_language_resolution(
     monkeypatch.setattr(exercises.exerciseinfo_list, "asyncio", listing)
     # Search resolves the code to wger's numeric id to pick the right translation
     languages = _CaptureList()
-    monkeypatch.setattr(exercises.language_list, "asyncio", languages)
+    monkeypatch.setattr(common.language_list, "asyncio", languages)
     args: dict[str, Any] = {"query": "squat"}
     if passed is not None:
         args["language"] = passed

@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 from wger_mcp.api_client import build_api_client
 from wger_mcp.config import Settings
-from wger_mcp.tools import exercises
+from wger_mcp.tools import common, exercises
 
 
 class _StubProvider:
@@ -53,9 +53,7 @@ def _mock(monkeypatch: pytest.MonkeyPatch, rows: list[dict[str, Any]]) -> _Listi
     """Search resolves the configured code to wger's numeric language id first."""
     listing = _Listing(rows)
     monkeypatch.setattr(exercises.exerciseinfo_list, "asyncio", listing)
-    monkeypatch.setattr(
-        exercises.language_list, "asyncio", _Listing([{"id": 2, "short_name": "en"}])
-    )
+    monkeypatch.setattr(common.language_list, "asyncio", _Listing([{"id": 2, "short_name": "en"}]))
     return listing
 
 

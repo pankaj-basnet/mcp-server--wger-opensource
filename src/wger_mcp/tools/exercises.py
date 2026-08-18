@@ -13,14 +13,21 @@ from wger_api_client.api.exercisecategory import exercisecategory_list
 from wger_api_client.api.exerciseinfo import exerciseinfo_list, exerciseinfo_retrieve
 from wger_api_client.api.ingredient import ingredient_list, ingredient_retrieve
 from wger_api_client.api.ingredientinfo import ingredientinfo_list
-from wger_api_client.api.language import language_list
 from wger_api_client.api.muscle import muscle_list
 from wger_api_client.client import AuthenticatedClient
 from wger_api_client.errors import UnexpectedStatus
 
 from ..api_client import paginate
 from ..config import Settings
-from .common import api_err, api_list_tool, api_tool, as_int, bad_request, opt
+from .common import (
+    api_err,
+    api_list_tool,
+    api_tool,
+    as_int,
+    bad_request,
+    language_id_resolver,
+    opt,
+)
 
 # wger stores the grades lowercase, and so does the client's enum
 _NUTRISCORE = r"^[A-Ea-e]$"
@@ -109,21 +116,8 @@ def register(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -> None
     # exerciseinfo filters WHICH exercises match a language, but each one still
     # carries every translation. Picking the wrong one hands the caller a name in
     # a language it did not ask for, so resolve the code to wger's numeric id and
-    # prefer that translation. Cached: the language table is static.
-    _language_id: dict[str, int | None] = {}
-
-    async def _language_id_for(code: str) -> int | None:
-        if code not in _language_id:
-            try:
-                rows = await paginate(language_list.asyncio, client=api, limit=5, short_name=code)
-            except (UnexpectedStatus, httpx.HTTPError):
-                # A lookup failure must not fail the search: without an id the
-                # shaping falls back to the first translation, as it did before.
-                return None
-            _language_id[code] = next(
-                (r.get("id") for r in rows if isinstance(r, dict) and r.get("id")), None
-            )
-        return _language_id[code]
+    # prefer that translation.
+    _language_id_for = language_id_resolver(api)
 
     async def _search(query: str, lang: str, limit: int) -> list[dict[str, Any]]:
         """One name-search, shaped down to what picks an exercise."""

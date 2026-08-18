@@ -264,12 +264,13 @@ This matters most for agents driven by small local models, whose tool-selection 
 | `set_slot_entry_config(slot_entry_id, kind, value, iteration?, operation?, step?, repeat?, weight_unit?)` | Add a per-iteration config record. `weight_unit` applies to `kind='weight'`/`'max_weight'` and is recorded on the slot entry |
 | `update_slot_entry_config(kind, config_id, value?, iteration?, ...)` / `delete_slot_entry_config(kind, config_id)` | Patch / delete a config record (use to bump weight on progression) |
 | `add_exercise_with_sets(day_id, exercise_id, sets, reps, weight?, slot_order?, weight_unit?, rir?)` | Convenience: slot + entry + sets/reps configs in one call. Omit `weight` to prescribe sets without a load |
+| `get_workout_for_date(routine_id, workout_date?)` | What the routine prescribes on a date (default today): one entry per planned SET, with exercise name, `slot_entry_id`, reps, weight and RiR. Feed its ids into `log_set` |
 
 ### Workout logs
 
 | Tool | Description |
 |------|-------------|
-| `log_set(exercise_id, reps, weight, workout_log_date?, rir?, weight_unit?)` | Add a workout log entry. `weight_unit` is `kg` (default) or `lb`; the weight is stored in the unit given, with no conversion |
+| `log_set(exercise_id, reps, weight, workout_log_date?, rir?, weight_unit?, routine_id?, slot_entry_id?, iteration?)` | Add a workout log entry. `weight_unit` is `kg` (default) or `lb`; the weight is stored in the unit given, with no conversion. Pass `routine_id` / `slot_entry_id` / `iteration` (all from `get_workout_for_date`) to attach the set to the plan it came from — without them the log is freestanding and no routine view or routine statistic can see it |
 | `list_workout_logs(date_from?, date_to?, exercise_id?, limit?)` / `get_workout_log(log_id)` | Read entries |
 | `update_workout_log(log_id, reps?, weight?, rir?, when?, weight_unit?)` / `delete_workout_log(log_id)` | Edit / remove an entry |
 
