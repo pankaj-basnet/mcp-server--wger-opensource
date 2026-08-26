@@ -994,7 +994,7 @@ def register_write(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -
             )
         except (UnexpectedStatus, httpx.HTTPError) as exc:
             return api_err(exc) | {"stage": "slot"}
-        result["slot"] = slot.to_dict()
+        result["slot"] = {"id": slot.id}
 
         try:
             entry = await slot_entry_create.asyncio(
@@ -1015,7 +1015,7 @@ def register_write(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -
             if rolled_back:
                 result.pop("slot")
             return result | api_err(exc) | {"stage": "slot-entry", "slot_rolled_back": rolled_back}
-        result["slot_entry"] = entry.to_dict()
+        result["slot_entry"] = {"id": entry.id}
 
         # The configs only depend on the entry, so they go out together
         async def _config(kind: str, value: int | str) -> Any:
@@ -1040,7 +1040,7 @@ def register_write(mcp: FastMCP, api: AuthenticatedClient, settings: Settings) -
             if isinstance(outcome, BaseException):
                 failed = failed or (kind, outcome)
                 continue
-            result[f"{kind}_config"] = outcome.to_dict()
+            result[f"{kind}_config"] = {"id": outcome.id}
         if failed is not None:
             kind, exc = failed
             if not isinstance(exc, UnexpectedStatus | httpx.HTTPError):

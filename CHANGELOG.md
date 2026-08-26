@@ -5,6 +5,13 @@ notes. This file records important changes to *this package*.
 
 ## Unreleased
 
+* `add_exercise_with_sets` returns the created ids, as its docstring always
+  said, instead of the full serialised slot, slot-entry and config objects.
+  Measured over a real routine build: 29 calls returned 62,878 characters,
+  38.7% of every tool result in the session, for what a caller uses as three
+  ids. Partial-failure diagnostics (`stage`, `slot_rolled_back`, the API error
+  body) are unchanged, since those are the fields a caller actually reads.
+
 * The routine tools split into `routines_read` (9 tools) and `routines_write`
   (16), selectable separately through `MCP_TOOLS`. The authoring half is ~4.2k
   tokens of schema — nearly a quarter of the whole surface — that an agent
