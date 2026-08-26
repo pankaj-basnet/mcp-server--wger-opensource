@@ -5,6 +5,8 @@ notes. This file records important changes to *this package*.
 
 ## Unreleased
 
+## 0.2.0
+
 * `add_exercise_with_sets` returns the created ids, as its docstring always
   said, instead of the full serialised slot, slot-entry and config objects.
   Measured over a real routine build: 29 calls returned 62,878 characters,
@@ -59,4 +61,7 @@ notes. This file records important changes to *this package*.
   one entry per planned set, with the exercise name and the ids `log_set`
   needs. Reading the same thing by walking days, slots, entries and configs
   costs dozens of requests.
+
+## 0.1.0
+
 * First release on PyPI: `pip install wger-mcp` / `uvx wger-mcp` instead of needing a git checkout.
