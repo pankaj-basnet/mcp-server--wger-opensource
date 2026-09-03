@@ -527,8 +527,9 @@ class TestStdioAuthStrategy:
 
 class TestVersionReporting:
     def test_dash_dash_version_matches_the_installed_distribution(self) -> None:
-        """argparse's `action="version"` reads `wger_mcp.__version__` at import
-        time and, exactly what `importlib.metadata` should return too."""
+        """--version prints what argparse read from wger_mcp.__version__ at
+        import time, which has to be the version the installed distribution
+        reports."""
         proc = subprocess.run(
             [sys.executable, "-m", "wger_mcp.server", "--version"],
             capture_output=True,
@@ -541,8 +542,10 @@ class TestVersionReporting:
         assert proc.stdout.strip() == expected
 
     def test_version_flag_needs_no_wger_credentials(self) -> None:
-        """'--version' must short-circuit before Settings() is  built.
-        A missing WGER_API_KEY shouldn't break `wger-mcp --version`."""
+        """--version has to answer before Settings() is built. Asking an
+        install which version it is happens exactly when nothing is configured
+        yet, so a missing WGER_API_KEY must not turn the question into an
+        error."""
         env = {k: v for k, v in _env().items() if not k.startswith("WGER_")}
         proc = subprocess.run(
             [sys.executable, "-m", "wger_mcp.server", "--version"],
@@ -585,8 +588,9 @@ class _FakeProvider:
 
 
 async def test_server_aclose_closes_every_owned_client() -> None:
-    """aclose() call cleans up all of three independently-closable clients.
-    verify all three, not just that the call doesn't raise."""
+    """Server owns three separately-closable clients, so all three are
+    asserted: an aclose() that closed only the first two would raise nothing
+    and leave the rest open."""
     api = _FakeApi()
     off_http = _FakeAsyncClient()
     provider = _FakeProvider()
@@ -600,13 +604,13 @@ async def test_server_aclose_closes_every_owned_client() -> None:
 
 
 class TestStdioSettingsPure:
-    """Construct Settings() directly — no subprocess.
-    Settings for pure-logic assertions.
+    """Settings() built directly, without a subprocess, for the cases where
+    the logic is the whole point.
     """
 
     def test_legacy_token_name_alone_satisfies_stdio(self) -> None:
-        """WGER_DEV_TOKEN must still work under stdio, exactly as
-        it does under the other strategies
+        """The old token name still configures stdio, as it does every other
+        strategy: renaming the variable did not retire it.
         """
         settings = Settings(  # type: ignore[call-arg]
             wger_base_url="https://wger.test",
@@ -617,6 +621,8 @@ class TestStdioSettingsPure:
         assert settings.wger_dev_token == "legacy-value"
 
     def test_new_name_wins_when_both_are_set(self) -> None:
+        """WGER_API_KEY is the current name, so it wins rather than racing the
+        legacy one for whichever pydantic happens to read last."""
         settings = Settings(  # type: ignore[call-arg]
             wger_base_url="https://wger.test",
             mcp_transport="stdio",
@@ -625,9 +631,8 @@ class TestStdioSettingsPure:
         assert settings.wger_dev_token == "current"
 
     def test_stdio_ignores_http_only_fields_without_erroring(self) -> None:
-        """host/port/mcp_path/allowed_hosts are meaningless under stdio, but
-        setting them anyway must not be
-        an error
+        """host, port and allowed_hosts mean nothing under stdio, but setting
+        them is not an error: one config file often serves both transports.
         """
         settings = Settings(  # type: ignore[call-arg]
             wger_base_url="https://wger.test",
@@ -644,12 +649,14 @@ class TestStdioSettingsPure:
 
 class TestTransportResolutionEdgeCases:
     def test_cli_value_is_case_sensitive_unlike_the_environment(self) -> None:
-        """an uppercase cli_value reaching resolve_transport should fail loudly"""
+        """--transport STDIO is refused where MCP_TRANSPORT=STDIO is accepted.
+        The flag is typed by hand, and normalising it quietly would hide the
+        typo the refusal points at."""
         with pytest.raises(ValueError):
             resolve_transport("STDIO", {})
 
     def test_empty_string_cli_value_falls_through_to_environment(self) -> None:
-        """an empty string must behave like "not provided", not like a literal transport name."""
+        """An empty string means "not provided", not a transport named ""."""
         assert resolve_transport("", {"MCP_TRANSPORT": "stdio"}) is Transport.stdio
 
     def test_whitespace_only_environment_value_counts_as_unset(self) -> None:
@@ -660,7 +667,7 @@ class TestTransportResolutionEdgeCases:
 
 
 def test_unknown_tool_group_is_rejected_under_stdio_too() -> None:
-    """register_all() raises the same ValueError regardless of transport"""
+    """register_all() raises the same ValueError whichever transport asked."""
     proc = subprocess.run(
         [sys.executable, "-m", "wger_mcp.server", "--transport", "stdio"],
         input="",
@@ -674,20 +681,26 @@ def test_unknown_tool_group_is_rejected_under_stdio_too() -> None:
 
 
 async def test_multiple_tool_selection_over_stdio() -> None:
-    """MCP_TOOLS accepts a comma list, not just a single group"""
+    """MCP_TOOLS takes a comma list, and every group named in it is registered.
+
+    Asserting only that some tools came back would hold just as well if the
+    list were split wrongly and only the first group survived.
+    """
     async with _session(_params(MCP_TOOLS="body_weight,measurements")) as session:
         await session.initialize()
         tools = await session.list_tools()
 
     names = {t.name for t in tools.tools}
-    assert names
+    assert "log_body_weight" in names, names
+    assert "log_measurement" in names, names
 
     # Nothing from an unrelated group should have been registered
     assert not any("ingredient" in n.lower() or "nutrition" in n.lower() for n in names)
 
 
 def test_missing_env_file_is_refused_under_http_transport() -> None:
-    """missing env file causes early refusal fires before any of that runs."""
+    """The refusal comes before the server binds a port, so an operator with a
+    typo gets the typo rather than a server running on stale environment."""
     proc = subprocess.run(
         [
             sys.executable,
@@ -710,7 +723,7 @@ def test_missing_env_file_is_refused_under_http_transport() -> None:
 
 
 def test_relative_env_file_path_resolves_against_the_process_cwd(tmp_path: Path) -> None:
-    """resolution of env file is relative to the spawned process's cwd"""
+    """A relative --env-file resolves against the server process's own cwd."""
     (tmp_path / "local.env").write_text("WGER_BASE_URL=https://wger.test\nWGER_API_KEY=k\n")
 
     proc = subprocess.Popen(
