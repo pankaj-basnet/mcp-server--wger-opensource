@@ -16,6 +16,7 @@ import sys
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from importlib.metadata import version as installed_version
 from pathlib import Path
 
 import anyio
@@ -35,7 +36,7 @@ from wger_mcp.config import (
     resolve_transport,
     transport_declared_in,
 )
-from wger_mcp.server import build_app, serve_stdio
+from wger_mcp.server import Server, build_app, serve_stdio
 
 from .conftest import scrubbed_env
 
@@ -359,8 +360,15 @@ class TestExplicitEnvFile:
     def test_the_typo_stops_the_process_with_a_sentence(self, tmp_path: Path) -> None:
         """Before: it started against whatever the environment still held."""
         proc = subprocess.run(
-            [sys.executable, "-m", "wger_mcp.server", "--transport", "stdio",
-             "--env-file", str(tmp_path / "typo.env")],
+            [
+                sys.executable,
+                "-m",
+                "wger_mcp.server",
+                "--transport",
+                "stdio",
+                "--env-file",
+                str(tmp_path / "typo.env"),
+            ],
             input="",
             capture_output=True,
             text=True,
@@ -515,3 +523,238 @@ class TestStdioAuthStrategy:
     def test_the_default_is_filled_in_when_nobody_chose(self) -> None:
         """Rewriting an unset field is picking a default, not discarding config."""
         assert self._load().mcp_auth is AuthStrategy.none
+
+
+class TestVersionReporting:
+    def test_dash_dash_version_matches_the_installed_distribution(self) -> None:
+        """argparse's `action="version"` reads `wger_mcp.__version__` at import
+        time and, exactly what `importlib.metadata` should return too."""
+        proc = subprocess.run(
+            [sys.executable, "-m", "wger_mcp.server", "--version"],
+            capture_output=True,
+            text=True,
+            env=_env(),
+            timeout=_TIMEOUT,
+        )
+        assert proc.returncode == 0
+        expected = f"wger-mcp {installed_version('wger-mcp')}"
+        assert proc.stdout.strip() == expected
+
+    def test_version_flag_needs_no_wger_credentials(self) -> None:
+        """'--version' must short-circuit before Settings() is  built.
+        A missing WGER_API_KEY shouldn't break `wger-mcp --version`."""
+        env = {k: v for k, v in _env().items() if not k.startswith("WGER_")}
+        proc = subprocess.run(
+            [sys.executable, "-m", "wger_mcp.server", "--version"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=_TIMEOUT,
+        )
+        assert proc.returncode == 0
+        assert "wger-mcp" in proc.stdout
+
+
+class _FakeAsyncClient:
+    """Records whether aclose() was awaited, without touching the network."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _FakeApi:
+    """Stands in for AuthenticatedClient: only get_async_httpx_client() is used
+    by Server.aclose()."""
+
+    def __init__(self) -> None:
+        self.http = _FakeAsyncClient()
+
+    def get_async_httpx_client(self) -> _FakeAsyncClient:
+        return self.http
+
+
+class _FakeProvider:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def test_server_aclose_closes_every_owned_client() -> None:
+    """aclose() call cleans up all of three independently-closable clients.
+    verify all three, not just that the call doesn't raise."""
+    api = _FakeApi()
+    off_http = _FakeAsyncClient()
+    provider = _FakeProvider()
+    server = Server(mcp=None, api=api, off_http=off_http, provider=provider)  # type: ignore[arg-type]
+
+    await server.aclose()
+
+    assert api.http.closed
+    assert off_http.closed
+    assert provider.closed
+
+
+class TestStdioSettingsPure:
+    """Construct Settings() directly — no subprocess.
+    Settings for pure-logic assertions.
+    """
+
+    def test_legacy_token_name_alone_satisfies_stdio(self) -> None:
+        """WGER_DEV_TOKEN must still work under stdio, exactly as
+        it does under the other strategies
+        """
+        settings = Settings(  # type: ignore[call-arg]
+            wger_base_url="https://wger.test",
+            mcp_transport="stdio",
+            wger_dev_token="legacy-value",
+        )
+        assert settings.mcp_auth is AuthStrategy.none
+        assert settings.wger_dev_token == "legacy-value"
+
+    def test_new_name_wins_when_both_are_set(self) -> None:
+        settings = Settings(  # type: ignore[call-arg]
+            wger_base_url="https://wger.test",
+            mcp_transport="stdio",
+            **{"WGER_API_KEY": "current", "WGER_DEV_TOKEN": "legacy"},
+        )
+        assert settings.wger_dev_token == "current"
+
+    def test_stdio_ignores_http_only_fields_without_erroring(self) -> None:
+        """host/port/mcp_path/allowed_hosts are meaningless under stdio, but
+        setting them anyway must not be
+        an error
+        """
+        settings = Settings(  # type: ignore[call-arg]
+            wger_base_url="https://wger.test",
+            mcp_transport="stdio",
+            wger_dev_token="k",
+            host="127.0.0.1",
+            port=9999,
+            allowed_hosts=["irrelevant.example.com"],
+        )
+        assert settings.mcp_transport is Transport.stdio
+        # Unused, but present
+        assert settings.host == "127.0.0.1"
+
+
+class TestTransportResolutionEdgeCases:
+    def test_cli_value_is_case_sensitive_unlike_the_environment(self) -> None:
+        """an uppercase cli_value reaching resolve_transport should fail loudly"""
+        with pytest.raises(ValueError):
+            resolve_transport("STDIO", {})
+
+    def test_empty_string_cli_value_falls_through_to_environment(self) -> None:
+        """an empty string must behave like "not provided", not like a literal transport name."""
+        assert resolve_transport("", {"MCP_TRANSPORT": "stdio"}) is Transport.stdio
+
+    def test_whitespace_only_environment_value_counts_as_unset(self) -> None:
+        assert resolve_transport(None, {"MCP_TRANSPORT": "   "}) is Transport.http
+
+
+# MCP_TOOLS validation must behave identically under stdio and http.
+
+
+def test_unknown_tool_group_is_rejected_under_stdio_too() -> None:
+    """register_all() raises the same ValueError regardless of transport"""
+    proc = subprocess.run(
+        [sys.executable, "-m", "wger_mcp.server", "--transport", "stdio"],
+        input="",
+        capture_output=True,
+        text=True,
+        env=_env(MCP_TOOLS="not_a_real_group"),
+        timeout=_TIMEOUT,
+    )
+    assert proc.returncode != 0
+    assert "names unknown tool group(s)" in proc.stderr
+
+
+async def test_multiple_tool_selection_over_stdio() -> None:
+    """MCP_TOOLS accepts a comma list, not just a single group"""
+    async with _session(_params(MCP_TOOLS="body_weight,measurements")) as session:
+        await session.initialize()
+        tools = await session.list_tools()
+
+    names = {t.name for t in tools.tools}
+    assert names
+
+    # Nothing from an unrelated group should have been registered
+    assert not any("ingredient" in n.lower() or "nutrition" in n.lower() for n in names)
+
+
+def test_missing_env_file_is_refused_under_http_transport() -> None:
+    """missing env file causes early refusal fires before any of that runs."""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "wger_mcp.server",
+            "--transport",
+            "http",
+            "--env-file",
+            "missing.env",
+        ],
+        input="",
+        capture_output=True,
+        text=True,
+        env=_env(),
+        timeout=_TIMEOUT,
+    )
+    assert proc.returncode != 0
+    assert "env file not found" in proc.stderr
+    assert "Uvicorn running" not in proc.stdout
+
+
+def test_relative_env_file_path_resolves_against_the_process_cwd(tmp_path: Path) -> None:
+    """resolution of env file is relative to the spawned process's cwd"""
+    (tmp_path / "local.env").write_text("WGER_BASE_URL=https://wger.test\nWGER_API_KEY=k\n")
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "wger_mcp.server",
+            "--transport",
+            "stdio",
+            "--env-file",
+            "local.env",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(tmp_path),
+        env=scrubbed_env(),
+    )
+    assert proc.stdin is not None and proc.stdout is not None
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "relpath-test", "version": "1"},
+        },
+    }
+    watchdog = threading.Timer(_TIMEOUT, proc.kill)
+    watchdog.start()
+    try:
+        proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+    finally:
+        watchdog.cancel()
+        proc.stdin.close()
+        stderr = proc.stderr.read() if proc.stderr else ""
+        proc.terminate()
+        proc.wait(timeout=_TIMEOUT)
+
+    assert line.strip(), f"server never answered initialize; stderr:\n{stderr}"
+    reply = json.loads(line)
+    assert reply["result"]["serverInfo"]["name"] == "wger"
